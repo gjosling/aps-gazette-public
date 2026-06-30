@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Data (pipeline outputs — not committed)
+data/pdfs/
+data/parsed/
+data/*.parquet
+data/release/
+data/manifest.csv
+data/parse_log.csv
+data/classify_batch_ids.json
+data/diagnostics/
+data/r2_pdf_listing.txt
+
+# But DO track committed reference files
+!data/agency_crosswalk.csv
+
+# Validation artefacts and dev scripts (not used in CI)
+validation/
+scripts/
+
+# Working notes
+TODO.md
+
+# LibreOffice lock files
+prompts/.~lock.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
