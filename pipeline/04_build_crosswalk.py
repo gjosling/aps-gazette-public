@@ -200,6 +200,7 @@ CANONICAL_AGENCIES = [
     "Fair Work Commission",
     "Safe Work Australia",
     "Asbestos and Silica Safety and Eradication Agency",
+    "Asbestos Safety and Eradication Agency",              # pre-rename alias; enables prefix-match on division strings
 
     # ── FOREIGN AFFAIRS AND TRADE PORTFOLIO ─────────────────────────────
     "Department of Foreign Affairs and Trade",
@@ -293,6 +294,9 @@ CANONICAL_FORWARD_MAP = {
     # Long-form NDIS QSC → short canonical form used consistently in the data
     "National Disability Insurance Scheme Quality and Safeguards Commission":
         "NDIS Quality and Safeguards Commission",
+    # Pre-rename alias → current canonical (renamed when silica-related diseases added to scope)
+    "Asbestos Safety and Eradication Agency":
+        "Asbestos and Silica Safety and Eradication Agency",
 }
 
 

@@ -70,6 +70,10 @@ DIVISION_REQUIRED = {
     'Office of the Official Secretary to the',
     'National Commission for Aboriginal and Torres Strait',   # div = "Islander Children and Young People"
     'Veterans’ Affairs (part of the Defence',
+    # SA portfolio prefix: gazette groups AIFS vacancies under the SA portfolio header;
+    # division field identifies the real sub-entity (e.g. "Australian Institute of Family Studies ...").
+    'Services Australia (part of the Social Services Portfolio)',
+    'Services Australia (part of the Social',                  # truncated form (PDF column wrap)
 }
 
 # Fallback canonical for single-entity portfolio strings when division-field
@@ -94,6 +98,8 @@ PORTFOLIO_FALLBACK = {
         'Department of Infrastructure, Transport, Regional Development, Communications and the Arts',
     'Infrastructure, Transport, Regional Development and Communications':
         'Department of Infrastructure, Transport, Regional Development, Communications and the Arts',
+    'Services Australia (part of the Social Services Portfolio)': 'Services Australia',
+    'Services Australia (part of the Social':                     'Services Australia',
 }
 
 
