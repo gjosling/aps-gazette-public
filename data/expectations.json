@@ -10,7 +10,7 @@
   "boilerplate_residual": {
     "phrase": "employed under other Acts",
     "since": "2025-07-01",
-    "max_pct_of_descriptions_clean": 6.0
+    "max_pct_of_descriptions_clean": 0.5
   },
-  "am_linkage": null
+  "am_linkage": {"min_am_rows": 3452, "min_groups": 2000, "max_groups": 3800}
 }

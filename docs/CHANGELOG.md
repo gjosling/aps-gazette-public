@@ -13,6 +13,26 @@ dataset-version bump.
 - **2026-07-06** — Build-time validation suite added; releases can no longer
   publish with failing checks.
 
+## 1.3.0 — 2026-07-07
+- **Changed:** `description_clean` method v2 (`2026-07-v2`) adds a corpus-wide
+  boilerplate pass. Fixes residual May-2025 gazette-template eligibility text that
+  the per-agency method could not remove for small agencies (~3.5–5% of
+  post-2025Q3 cleaned descriptions affected; now ≈0). The global pass also removes
+  the long-standing RecruitAbility standard passage from small-agency ads across
+  the whole 2020→present range, so some pre-2025 `description_clean` values change
+  too. `description` (raw) is unchanged. Job-family classifications of
+  already-classified rows are not re-run.
+
+## 1.2.0: 2026-07-06
+- **Added:** `is_affirmative_measure` and `posting_group_id`. Affirmative-measures
+  variants of one posting (same agency, base title, classification, closing date)
+  now share a linkage key; naive row counts overstate role counts by ~2.6% — see
+  the data dictionary for counting guidance. No existing column changed.
+  Measured on the 87,340-row release at implementation: 3,452 AM-flagged rows;
+  4,775 rows linked into 2,895 posting groups (1,381 multi-row + 1,514 singleton
+  AM groups); role keys (distinct `posting_group_id` else `vacancy_no`) = 85,460,
+  i.e. 1,880 excess rows (2.2%).
+
 ## 1.1.2: 2026-07-06
 - **Fixed:** interrupted parse runs could mark PDFs as parsed without persisting
   their records; parse log and raw parquet now flush together (every 100 PDFs and

@@ -6,8 +6,9 @@ gazette vacancy descriptions.
 Reads data/release/aps_gazette_vacancies.parquet, adds a description_clean column,
 and writes the updated file back (both parquet and csv.gz).
 
-Boilerplate method
-------------------
+Boilerplate method (two passes; effective set = per-agency ∪ global)
+-------------------------------------------------------------------
+Per-agency pass:
 1. Split each description into sentences (paragraph → newline → sentence-boundary).
 2. Strip section-label prefixes ("Duties", "Eligibility", "Notes") and drop sentences
    that begin with "About the/our/us" (agency mission section header).
@@ -19,7 +20,17 @@ Boilerplate method
 7. Flag the sentence only if it also appears across ≥ MIN_TITLES distinct job titles
    in that bin — this prevents bulk-recruitment templates (same role posted to many
    locations) from being mistaken for cross-role boilerplate.
-8. Reconstruct description_clean by joining the non-flagged sentences.
+
+Global pass (spec 05, review finding F4): the per-agency method can never learn
+gazette-wide template text for small agencies (their bins fall below MIN_BIN). A
+corpus-level pass bins ALL ads by half-year and flags a normalised sentence when,
+in any bin (≥ GLOBAL_MIN_BIN_ADS ads), it appears in ≥ GLOBAL_THRESHOLD of the
+bin AND spans ≥ GLOBAL_MIN_TITLES distinct job titles. The global set applies to
+every agency, including sub-MIN_BIN ones. It catches the RecruitAbility standard
+passage and the May-2025 gazette eligibility passage. Global-pass audit rows use
+agency_canonical = "__GLOBAL__".
+
+8. Reconstruct description_clean by joining the sentences flagged by neither pass.
 
 Ads with null description get null description_clean.
 
@@ -35,13 +46,15 @@ Redaction is idempotent: running the step twice produces the same result.
 
 Usage
 -----
-    python pipeline/07_clean_text.py [--threshold 0.30] [--min-titles 3] [--dry-run]
+    python pipeline/07_clean_text.py [--threshold 0.30] [--min-titles 3]
+        [--global-threshold 0.40] [--global-min-titles 30] [--dry-run]
 
 Outputs
 -------
     data/release/aps_gazette_vacancies.parquet      (updated in place, skipped with --dry-run)
     data/release/aps_gazette_vacancies.csv.gz       (updated in place, skipped with --dry-run)
-    data/diagnostics/boilerplate_sentences.csv      (always written — audit trail)
+    data/diagnostics/boilerplate_sentences.csv                        (stable name — always written)
+    data/diagnostics/boilerplate_sentences-<version>-<YYYYMMDD>.csv   (dated archive — always written)
 """
 
 import argparse
@@ -49,6 +62,7 @@ import collections
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -61,16 +75,30 @@ import release_io
 
 PARQUET_PATH  = Path("data/release/aps_gazette_vacancies.parquet")
 CSV_PATH      = Path("data/release/aps_gazette_vacancies.csv.gz")
-AUDIT_CSV     = Path("data/diagnostics/boilerplate_sentences.csv")
+AUDIT_DIR     = Path("data/diagnostics")
+AUDIT_CSV     = AUDIT_DIR / "boilerplate_sentences.csv"   # stable name (diff workflows)
 
 # Version of the boilerplate-stripping method, stamped into release metadata by
-# release_io.build_metadata. Spec 05 bumps this to "2026-07-v2".
-BOILERPLATE_METHOD_VERSION = "2025-v1"
+# release_io.build_metadata (parquet key aps_gazette:boilerplate_method_version and
+# the .meta.json sidecar) and used in the dated audit-CSV filename. BUMP THIS
+# constant on ANY change to the thresholds, sentence splitting/normalisation, or
+# pass structure — it is the only marker that description_clean was recomputed by a
+# different method. Spec 05 bumped v1 → v2 (added the global corpus-wide pass).
+BOILERPLATE_METHOD_VERSION = "2026-07-v2"
 
 DEFAULT_THRESHOLD  = 0.30
 DEFAULT_MIN_TITLES = 3
 MIN_BIN            = 10      # bins smaller than this are never used for flagging
 BIN_PERIOD         = "2Q"    # half-year (change to "Q" for quarterly)
+
+# Global (corpus-wide) pass — spec 05. Bins ALL ads by half-year; no MIN_BIN needed
+# (every half-year bin has thousands of ads), but degenerate partial periods are
+# skipped via GLOBAL_MIN_BIN_ADS.
+DEFAULT_GLOBAL_THRESHOLD  = 0.40   # ≥40% of a corpus bin; below this, one dominant
+                                   # agency's own blurb can cross the bar (see spec)
+DEFAULT_GLOBAL_MIN_TITLES = 30     # distinct normalised job titles in that bin
+GLOBAL_MIN_BIN_ADS        = 500    # skip corpus bins smaller than this (defensive)
+GLOBAL_AGENCY_SENTINEL    = "__GLOBAL__"   # agency_canonical value for global audit rows
 
 
 # ── Text processing ────────────────────────────────────────────────────────────
@@ -261,6 +289,92 @@ def build_boilerplate_sets(
     return agency_bp, audit_rows
 
 
+def build_global_boilerplate_set(
+    df: pd.DataFrame,
+    global_threshold: float,
+    global_min_titles: int,
+    bin_period: str,
+    min_bin_ads: int = GLOBAL_MIN_BIN_ADS,
+) -> tuple[frozenset[str], list[dict]]:
+    """
+    Corpus-level boilerplate pass (spec 05 / review F4). Bins ALL ads (no agency
+    split) by half-year and returns the set of normalised sentences that, in any
+    qualifying bin (≥ min_bin_ads ads):
+      - appear in ≥ global_threshold fraction of that bin's ads, AND
+      - span ≥ global_min_titles distinct normalised job titles in that
+        highest-fraction bin.
+
+    The global set catches gazette-wide template text (the RecruitAbility standard
+    passage; the May-2025 eligibility passage) that small agencies' per-agency bins
+    can never learn. It is unioned with each agency's set, applying to every agency
+    including sub-MIN_BIN ones — that is the fix.
+
+    Uses the same best-(highest-fraction)-bin machinery as build_boilerplate_sets,
+    so the flagged set is the conservative subset (a genuine corpus-wide template
+    dominant in ≥40% of thousands of ads spans hundreds of titles, so best-bin and
+    any-bin agree on the real targets).
+
+    Also returns audit_rows: one row per sentence that exceeded global_threshold
+    (flagged or rescued by the title guard), each with agency_canonical =
+    GLOBAL_AGENCY_SENTINEL and the same columns as the per-agency audit rows.
+    """
+    df = df[df["description"].notna()].copy()
+    df["_period"]     = pd.to_datetime(df["gazette_date"]).dt.to_period(bin_period)
+    df["_title_norm"] = df["job_title"].apply(normalise_title)
+
+    # per sentence: track best (highest-fraction) bin stats across all bins
+    sent_best:     dict[str, tuple] = {}
+    sent_original: dict[str, str]   = {}
+
+    for period, grp in df.groupby("_period"):
+        if len(grp) < min_bin_ads:
+            continue                                 # degenerate partial period
+        bin_size = len(grp)
+
+        sent_ads:    collections.defaultdict[str, set] = collections.defaultdict(set)
+        sent_titles: collections.defaultdict[str, set] = collections.defaultdict(set)
+
+        for _, row in grp.iterrows():
+            sents_in_ad: set[str] = set()
+            for s in split_sentences(row["description"]):
+                ns = normalise(s)
+                if ns:
+                    sents_in_ad.add(ns)
+                    if ns not in sent_original:
+                        sent_original[ns] = s
+            for ns in sents_in_ad:
+                sent_ads[ns].add(row["vacancy_no"])
+                sent_titles[ns].add(row["_title_norm"])
+
+        for ns, ads in sent_ads.items():
+            frac     = len(ads) / bin_size
+            n_titles = len(sent_titles[ns])
+            if ns not in sent_best or frac > sent_best[ns][1]:
+                sent_best[ns] = (str(period), frac, len(ads), bin_size, n_titles)
+
+    flagged: set[str]      = set()
+    audit_rows: list[dict] = []
+    for ns, (period_str, frac, n_ads, bin_size, n_titles) in sent_best.items():
+        if frac < global_threshold:
+            continue
+        is_flagged = n_titles >= global_min_titles
+        if is_flagged:
+            flagged.add(ns)
+        audit_rows.append({
+            "agency_canonical":    GLOBAL_AGENCY_SENTINEL,
+            "half_year":           period_str,
+            "sentence_normalised": ns,
+            "n_ads":               n_ads,
+            "bin_size":            bin_size,
+            "pct_of_bin":          round(frac * 100, 1),
+            "n_titles":            n_titles,
+            "flagged":             is_flagged,
+            "sentence_original":   sent_original.get(ns, ""),
+        })
+
+    return frozenset(flagged), audit_rows
+
+
 # ── Cleaning ───────────────────────────────────────────────────────────────────
 
 def clean_description(
@@ -276,7 +390,13 @@ def clean_description(
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def run(threshold: float, min_title_diversity: int, dry_run: bool) -> None:
+def run(
+    threshold: float,
+    min_title_diversity: int,
+    global_threshold: float,
+    global_min_titles: int,
+    dry_run: bool,
+) -> None:
     if not PARQUET_PATH.exists():
         print(f"Input not found: {PARQUET_PATH}", file=sys.stderr)
         print("Run '06_build_release.py' first.", file=sys.stderr)
@@ -285,13 +405,16 @@ def run(threshold: float, min_title_diversity: int, dry_run: bool) -> None:
     df = pd.read_parquet(PARQUET_PATH)
     print(
         f"Loaded {PARQUET_PATH}: {len(df):,} rows, {len(df.columns)} cols\n"
-        f"Threshold: {threshold:.0%}  |  min_titles: {min_title_diversity}  "
+        f"Method version: {BOILERPLATE_METHOD_VERSION}\n"
+        f"Per-agency — threshold: {threshold:.0%}  |  min_titles: {min_title_diversity}  "
         f"|  min_bin: {MIN_BIN}  |  period: {BIN_PERIOD}\n"
+        f"Global     — threshold: {global_threshold:.0%}  |  min_titles: {global_min_titles}  "
+        f"|  min_bin_ads: {GLOBAL_MIN_BIN_ADS}  |  period: {BIN_PERIOD}\n"
     )
 
-    # ── Build boilerplate sets ─────────────────────────────────────────────────
+    # ── Build per-agency boilerplate sets ──────────────────────────────────────
 
-    print("Building boilerplate sets...")
+    print("Building per-agency boilerplate sets...")
     agency_bp, audit_rows = build_boilerplate_sets(
         df, threshold, MIN_BIN, BIN_PERIOD, min_title_diversity
     )
@@ -314,12 +437,39 @@ def run(threshold: float, min_title_diversity: int, dry_run: bool) -> None:
             print(f"    {len(bp):3d}  {ag}")
     print()
 
-    # ── Apply per-row ──────────────────────────────────────────────────────────
+    # ── Build global (corpus-wide) boilerplate set ─────────────────────────────
 
-    print("Applying boilerplate filter...")
+    print("Building global boilerplate set...")
+    global_bp, global_audit_rows = build_global_boilerplate_set(
+        df, global_threshold, global_min_titles, BIN_PERIOD
+    )
+    g_freq_thresh = len(global_audit_rows)
+    g_rescued     = g_freq_thresh - len(global_bp)
+    print(f"  {g_freq_thresh:,} sentences exceeded the {global_threshold:.0%} global frequency threshold")
+    print(f"  {g_rescued:,} rescued by title-diversity guard (< {global_min_titles} distinct titles)")
+    print(f"  {len(global_bp):,} sentences flagged globally (apply to EVERY agency)\n")
+
+    # Guard 2 (spec 05): print the full __GLOBAL__ flagged-sentence list for human
+    # review. Anything role-specific here means GLOBAL_THRESHOLD is too low.
+    flagged_global_audit = sorted(
+        (r for r in global_audit_rows if r["flagged"]),
+        key=lambda r: r["pct_of_bin"],
+        reverse=True,
+    )
+    print(f"  === __GLOBAL__ flagged sentences ({len(flagged_global_audit)}) ===")
+    for r in flagged_global_audit:
+        print(f"    [{r['pct_of_bin']:>5.1f}% of {r['bin_size']:,} ads, "
+              f"{r['n_titles']} titles, {r['half_year']}]  {r['sentence_original']}")
+    print()
+
+    audit_rows = audit_rows + global_audit_rows
+
+    # ── Apply per-row (per-agency set ∪ global set) ────────────────────────────
+
+    print("Applying boilerplate filter (per-agency ∪ global)...")
 
     def _clean(row) -> str | None:
-        bp = agency_bp.get(row["agency_canonical"], frozenset())
+        bp = agency_bp.get(row["agency_canonical"], frozenset()) | global_bp
         return clean_description(row["description"], bp)
 
     df["description_clean"] = df.apply(_clean, axis=1)
@@ -348,15 +498,24 @@ def run(threshold: float, min_title_diversity: int, dry_run: bool) -> None:
     print(f"    ({clean_chars:,} / {orig_chars:,} chars)")
     print(f"  Per-ad retention — median: {q[0.50]:.1%}  Q25: {q[0.25]:.1%}  Q75: {q[0.75]:.1%}\n")
 
-    # ── Audit CSV (always written) ─────────────────────────────────────────────
+    # ── Audit CSV (always written: stable name + dated archive) ────────────────
+    #
+    # Both files carry the same content (per-agency + __GLOBAL__ rows). The stable
+    # name keeps diff workflows working; the dated archive (method version + build
+    # date, UTC) preserves the audit for each method version. Local files only —
+    # no R2 push (spec-05 decision: the audit is deterministic and regenerable).
 
-    AUDIT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
     audit_df = (
         pd.DataFrame(audit_rows)
         .sort_values(["agency_canonical", "pct_of_bin"], ascending=[True, False])
     )
+    build_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    dated_audit = AUDIT_DIR / f"boilerplate_sentences-{BOILERPLATE_METHOD_VERSION}-{build_date}.csv"
     audit_df.to_csv(AUDIT_CSV, index=False)
+    audit_df.to_csv(dated_audit, index=False)
     print(f"Audit CSV → {AUDIT_CSV}  ({len(audit_df):,} rows)")
+    print(f"Audit CSV → {dated_audit}  ({len(audit_df):,} rows)")
     print(f"  {audit_df['flagged'].sum():,} flagged  |  {(~audit_df['flagged']).sum():,} rescued by title-diversity guard\n")
 
     # ── PII redaction ─────────────────────────────────────────────────────────
@@ -426,9 +585,21 @@ if __name__ == "__main__":
              f"mistaken for boilerplate (default: {DEFAULT_MIN_TITLES})",
     )
     parser.add_argument(
+        "--global-threshold", type=float, default=DEFAULT_GLOBAL_THRESHOLD, metavar="FRAC",
+        help=f"Corpus-wide pass: fraction of ALL ads in a half-year bin that must "
+             f"contain a sentence to flag it as gazette-wide boilerplate "
+             f"(default: {DEFAULT_GLOBAL_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--global-min-titles", type=int, default=DEFAULT_GLOBAL_MIN_TITLES, metavar="N",
+        help=f"Corpus-wide pass: minimum distinct job titles a sentence must span in "
+             f"its highest-frequency bin to be flagged globally "
+             f"(default: {DEFAULT_GLOBAL_MIN_TITLES})",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="compute and report without writing parquet/csv output files "
-             "(audit CSV is still written)",
+             "(audit CSVs are still written)",
     )
     args = parser.parse_args()
 
@@ -438,5 +609,17 @@ if __name__ == "__main__":
     if args.min_titles < 1:
         print("--min-titles must be ≥ 1", file=sys.stderr)
         sys.exit(1)
+    if not 0 < args.global_threshold < 1:
+        print("--global-threshold must be between 0 and 1 (exclusive)", file=sys.stderr)
+        sys.exit(1)
+    if args.global_min_titles < 1:
+        print("--global-min-titles must be ≥ 1", file=sys.stderr)
+        sys.exit(1)
 
-    run(threshold=args.threshold, min_title_diversity=args.min_titles, dry_run=args.dry_run)
+    run(
+        threshold=args.threshold,
+        min_title_diversity=args.min_titles,
+        global_threshold=args.global_threshold,
+        global_min_titles=args.global_min_titles,
+        dry_run=args.dry_run,
+    )

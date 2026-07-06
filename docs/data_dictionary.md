@@ -94,6 +94,8 @@ The convention is enforced at build time by the division-mismatch check (`pipeli
 | Column | Type | Description |
 |--------|------|-------------|
 | `job_title` | string | Job title as printed in the notice. |
+| `is_affirmative_measure` | bool (never null) | True where `job_title` matches `(?i)affirmative\s+measure` (nulls → False). Flags roles advertised under an Affirmative Measures variant. |
+| `posting_group_id` | string (nullable) | 12-hex-char key linking Affirmative Measures variants of one posting to each other and their base posting. Populated **only** for rows belonging to a group that contains ≥ 1 AM row (including a singleton AM row, which gets a group of size 1). Null everywhere else. See the "Affirmative-measures multi-posting" limitation below for counting guidance. |
 | `job_type` | string | Employment type as printed. Two comma-separated dimensions (hours arrangement and tenure) each semicolon-separated where multiple values apply (e.g. `Full-Time;Part-Time, Ongoing;Non-Ongoing`). |
 | `location` | string | Work location as printed. May be multi-line or abbreviated. |
 | `location_normalised` | string | Same as `location` with comma-delimited parts sorted alphabetically. Use this column when grouping by location. The raw field preserves print order, which varies across notices for the same locations. Null where `location` is null. |
@@ -105,6 +107,8 @@ The convention is enforced at build time by the division-mismatch check (`pipeli
 | `position_number` | string | Position identifier as printed. |
 | `closing_date_raw` | string | Closing date string as printed in the notice. |
 | `closing_date` | date | Closing date parsed from `closing_date_raw`. |
+
+**`posting_group_id` null semantics:** `posting_group_id = null` means "this row was not part of any affirmative-measures posting cluster" — it does **not** assert the row is unrelated to any other row. Non-AM multi-postings (bulk campaigns, re-advertisements) are deliberately not linked: the review found ~1,900 non-AM multi-row title groups that include genuinely distinct positions, and linking them would over-merge.
 
 ### Office arrangement
 
@@ -127,7 +131,12 @@ The convention is enforced at build time by the division-mismatch check (`pipeli
 | `description_clean` | string | Boilerplate-stripped and PII-redacted version of `description`. Agency-standard sentences (mission statements, RecruitAbility text, citizenship requirements, standard screening language) are removed; role-specific content is preserved. PII redaction follows the same rules as `description`. Null where `description` is null or where the entire description consisted of boilerplate. See Notes below. |
 | `duties_text` | string | Job responsibilities section extracted from `description`, bounded by the `Duties`/`The Role` section marker and the `Eligibility` marker. Section labels are stripped. Email addresses, phone numbers, and title-case contact officer names are redacted (see `description` for redaction caveats). Null where no duties-type marker is present. Where `Eligibility` is absent, text runs to the end of `description`. |
 
-**`description_clean` method:** Produced by `pipeline/07_clean_text.py` using a frequency-based method: sentences appearing in ≥30% of an agency's ads within any half-year period and across ≥3 distinct job titles are flagged as boilerplate and removed. The title-diversity guard prevents bulk recruitment campaigns (identical ads posted to multiple locations under the same title) from being misidentified as boilerplate.
+**`description_clean` method:** Produced by `pipeline/07_clean_text.py` using a frequency-based method with two passes; a sentence removed by either pass is stripped.
+
+- **Per-agency pass:** sentences appearing in ≥30% of an agency's ads within any half-year bin of ≥10 ads, and across ≥3 distinct job titles, are flagged as boilerplate. The title-diversity guard prevents bulk recruitment campaigns (identical ads posted to multiple locations under the same title) from being misidentified as boilerplate.
+- **Global pass:** sentences appearing in ≥40% of *all* ads in any half-year bin, and across ≥30 distinct job titles, are flagged corpus-wide and removed from every agency. This catches gazette-wide template text — the RecruitAbility standard passage and the May-2025 eligibility passage — that small agencies' own bins can never learn (a small agency never reaches the 10-ad per-bin minimum, so the per-agency pass alone would leave that template in their ads).
+
+The method is **versioned**; the current version is `2026-07-v2` and is recorded in the parquet key-value metadata (`aps_gazette:boilerplate_method_version`) and the `.meta.json` sidecar. `description_clean` may change retroactively between method versions — the raw `description` column never does. The canonical example is the May-2025 gazette template change: from 2025Q3 the raw descriptions gained a standard eligibility passage ("… employed under the Public Service Act 1999. Similar conditions may apply when employed under other Acts. For clarification please contact the agency.") present in ~77% of notices; the `2026-07-v2` global pass removes it from `description_clean`, including for the small agencies the earlier per-agency-only method could not clean.
 
 ### Job family classification
 
@@ -142,6 +151,53 @@ Classified using `claude-sonnet-4-6` against the [APSC 2025 Job Family Framework
 ---
 
 ## Known limitations
+
+### Affirmative-measures multi-posting
+
+APS agencies frequently gazette the same role two or three times: a base
+advertisement plus one or more **Affirmative Measures** variants (Disability;
+Aboriginal and Torres Strait Islander / First Nations), each with its own
+`vacancy_no`. A naive `count(*)` therefore overstates the number of distinct
+roles advertised. In the current release there are **3,452 AM-titled rows**; the
+AM-duplicate excess is roughly **2.6% of the dataset** and has grown over time
+(228 AM rows in 2020 → 721 in 2024).
+
+`posting_group_id` links these variants. Rows sharing an agency, base title (with
+the AM phrasing stripped), classification, and closing date receive a common
+12-hex-char id — but only when at least one row in the group is AM-flagged. For
+role-level counts, count distinct `posting_group_id` where present, else
+`vacancy_no`:
+
+```python
+df["role_key"] = df["posting_group_id"].fillna(df["vacancy_no"])
+n_roles = df["role_key"].nunique()
+```
+
+On the current release this collapses 87,340 rows to **85,460 role keys** (1,880
+excess rows, 2.2%).
+
+**Residual risks:**
+
+- **Generic-title over-merge (accepted, rare):** where an agency closes two
+  genuinely distinct same-level, same-title roles on one date (e.g. two
+  "Assistant Director" postings), the key cannot tell them apart and may merge
+  them. Observed once in a 30-group hand-check and judged a plausible true pair;
+  accepted as a rare residual.
+- **Re-advertisements not linked:** `posting_group_id` links within **one closing
+  cycle only**. The same role re-advertised with a later closing date forms a
+  separate group by design.
+- **Classification-split under-merge (~1% of groups):** because
+  `classification_code` is part of the key, groups where the base row advertises
+  a multi-level band (e.g. `APS5;APS6`) and the AM row a single level (`APS6`) can
+  fail to link the AM row to its base. This is deliberate: **under-merging is
+  preferred to over-merging** — an unlinked duplicate is at worst the status quo,
+  whereas silently collapsing distinct roles understates hiring.
+
+**`position_number` is *not* used for linkage.** It was measured and rejected:
+~85% of true AM groups mint a *separate per-variant requisition number* (so a
+position-number key would fail to link them), and 58% of reused position numbers
+span genuinely distinct roles (so it would also over-merge). Linkage is computed
+purely from the (agency, AM-stripped title, classification, closing date) hash.
 
 ### Job family classification accuracy
 

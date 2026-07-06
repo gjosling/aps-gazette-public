@@ -287,21 +287,26 @@ def check_division_mismatch(df, exp) -> list:       # 2
 
 def check_am_groups(df, exp) -> list:               # 5 (activates after spec 04)
     """AM-group count bounds. Dormant while expectations.am_linkage is null.
-    When non-null: FAIL if posting_group_id is missing (spec ordering violated);
-    otherwise WARN if counts fall outside the configured bounds.
+    When non-null: FAIL if the spec-04 columns are missing (spec ordering
+    violated); otherwise WARN if counts fall outside the configured bounds.
 
-    NOTE: spec 04 finalises the precise AM-flag predicate. Until then this reads
-    the presence of a non-null posting_group_id as the AM flag; wire the exact
-    predicate when spec 04 lands.
+    AM-flag predicate (spec 04, finalised): a row is AM-flagged iff
+    is_affirmative_measure is True — i.e. job_title matches (?i)affirmative
+    measure. min_am_rows bounds that count. This replaces the spec-01 placeholder
+    that read a non-null posting_group_id as the AM flag (posting_group_id counts
+    linked rows — AM variants *and* their base postings — not AM-flagged rows).
     """
     am = exp.get("am_linkage")
     if am is None:
         return []
-    if "posting_group_id" not in df.columns:
-        return [Finding(FAIL, "am_linkage", "expectations.am_linkage is set but posting_group_id column is missing (spec 04 ordering violated)")]
+    missing = [c for c in ("is_affirmative_measure", "posting_group_id") if c not in df.columns]
+    if missing:
+        return [Finding(FAIL, "am_linkage",
+                        f"expectations.am_linkage is set but column(s) {missing} missing "
+                        f"(spec 04 ordering violated)")]
     findings = []
     grp = df["posting_group_id"]
-    am_rows = int(grp.notna().sum())
+    am_rows = int(df["is_affirmative_measure"].sum())
     n_groups = int(grp.dropna().nunique())
     min_am_rows = am.get("min_am_rows")
     min_groups = am.get("min_groups")
@@ -514,12 +519,13 @@ def print_current(expectations, release_path=RELEASE_PARQUET) -> None:
         boiler["max_pct_of_descriptions_clean"] = None
     observed["boilerplate_residual"] = boiler
 
-    if "posting_group_id" in df.columns:
+    if "posting_group_id" in df.columns and "is_affirmative_measure" in df.columns:
         grp = df["posting_group_id"]
+        n_groups = int(grp.dropna().nunique())
         observed["am_linkage"] = {
-            "min_am_rows": int(grp.notna().sum()),
-            "min_groups": int(grp.dropna().nunique()),
-            "max_groups": int(grp.dropna().nunique()),
+            "min_am_rows": int(df["is_affirmative_measure"].sum()),
+            "min_groups": n_groups,
+            "max_groups": n_groups,
         }
     else:
         observed["am_linkage"] = None

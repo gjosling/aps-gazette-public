@@ -8,7 +8,10 @@ ensures duties_text follows description, then writes:
   data/release/aps_gazette_vacancies.csv.gz
 """
 
+import datetime
+import hashlib
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -23,6 +26,97 @@ import release_io
 # ── Load ──────────────────────────────────────────────────────────────────────
 
 SRC = 'data/gazette_vacancies_crosswalk.parquet'
+
+# ── Affirmative-measures linkage (spec 04) ────────────────────────────────────
+#
+# APS agencies gazette the same role 2–3 times under Affirmative Measures
+# variants (Disability / Aboriginal and Torres Strait Islander) with distinct
+# vacancy_nos. is_affirmative_measure flags the AM-titled rows; posting_group_id
+# links AM variants of one posting to each other and their base posting, so that
+# role-level counts can collapse the AM duplicate excess. Both columns are pure
+# functions of existing columns, recomputed on every rebuild (no state file).
+#
+# Linkage is hash-only: position_number is NOT used — measured this session, it
+# under-links (~85% of true AM groups mint a separate requisition number per
+# variant) and over-merges (58% of reused position numbers span distinct roles).
+# The group key is (agency_canonical, AM-stripped normalised title,
+# classification_code as printed, closing_date). The classification component
+# trades rare over-merges for ~1% under-merges — under-merging is the accepted
+# direction. See docs/data_dictionary.md and specs/04-am-linkage.md.
+
+AM_TITLE_RE = re.compile(r'(?i)affirmative\s+measure')
+
+
+def strip_am(title: str) -> str:
+    t = title
+    # parenthesised variants: "(Affirmative Measures - Disability)", "(Affirmative Measure)", ...
+    t = re.sub(r'\(\s*[^()]*affirmative\s+measures?[^()]*\)', ' ', t, flags=re.I)
+    # dash/comma-attached variants incl. target group:
+    # "- Affirmative Measures Indigenous", "– Affirmative Measure-Disability",
+    # ", Affirmative Measures - Aboriginal and Torres Strait Islander"
+    t = re.sub(r'[-–—,:]?\s*affirmative\s+measures?\b[\s–—:-]*'
+               r'(?:disability|indigenous|first\s+nations?|'
+               r'aboriginal(?:\s+and\s+torres\s+strait\s+islander)?|'
+               r'torres\s+strait\s+islander)?s?\b',
+               ' ', t, flags=re.I)
+    t = re.sub(r'affirmative\s+measures?', ' ', t, flags=re.I)   # residual
+    return t
+
+
+def norm_title(title) -> str:
+    if not isinstance(title, str):
+        return ""
+    t = strip_am(title).lower()
+    t = re.sub(r'[^\w\s]', ' ', t)          # kills trailing "- " separators, dashes, parens
+    return re.sub(r'\s+', ' ', t).strip()
+
+
+def _str_or_empty(v) -> str:
+    """agency_canonical / classification_code coerced to str; nulls (None, pd.NA)
+    → "". Avoids `pd.NA or ""`, whose truthiness raises."""
+    return v if isinstance(v, str) else ""
+
+
+def _iso_or_empty(v) -> str:
+    """closing_date (datetime.date) → ISO string; nulls (None/NaT/NaN) → ""."""
+    return v.isoformat() if isinstance(v, datetime.date) else ""
+
+
+def add_am_linkage(df: pd.DataFrame) -> pd.DataFrame:
+    """Add is_affirmative_measure and posting_group_id, placed immediately after
+    job_title. posting_group_id is populated only for rows in a key-group that
+    contains >= 1 AM-flagged row (incl. a singleton AM row); null everywhere else."""
+    is_am = df["job_title"].apply(
+        lambda t: bool(AM_TITLE_RE.search(t)) if isinstance(t, str) else False
+    )
+
+    key = (
+        df["agency_canonical"].map(_str_or_empty) + "\x1f"
+        + df["job_title"].map(norm_title) + "\x1f"
+        + df["classification_code"].map(_str_or_empty) + "\x1f"
+        + df["closing_date"].map(_iso_or_empty)
+    )
+    am_keys = set(key[is_am])
+    group_id = key.where(key.isin(am_keys)).map(
+        lambda k: hashlib.sha1(k.encode()).hexdigest()[:12] if isinstance(k, str) else None
+    )
+
+    df = df.copy()
+    df["is_affirmative_measure"] = is_am.to_numpy(dtype=bool)
+    df["posting_group_id"] = group_id.to_numpy()
+
+    # Placement: both columns immediately after job_title, in this order.
+    cols = [c for c in df.columns if c not in ("is_affirmative_measure", "posting_group_id")]
+    jt = cols.index("job_title")
+    cols = cols[:jt + 1] + ["is_affirmative_measure", "posting_group_id"] + cols[jt + 1:]
+    df = df[cols]
+
+    n_am = int(is_am.sum())
+    n_linked = int(df["posting_group_id"].notna().sum())
+    n_groups = int(df["posting_group_id"].dropna().nunique())
+    print(f"AM linkage: {n_am:,} AM rows; {n_linked:,} rows linked into "
+          f"{n_groups:,} posting groups")
+    return df
 
 
 def run():
@@ -108,6 +202,10 @@ def run():
 
     df['gazette_date'] = pd.to_datetime(df['gazette_date']).dt.date
     print("gazette_date: converted to date")
+
+    # ── Affirmative-measures linkage ──────────────────────────────────────────────
+
+    df = add_am_linkage(df)
 
     # ── Validation ────────────────────────────────────────────────────────────────
     #
