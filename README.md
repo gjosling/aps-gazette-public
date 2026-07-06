@@ -10,8 +10,12 @@ The release dataset is available in two formats:
 
 - [Parquet](https://data.foiforest.org/gazette/aps_gazette_vacancies.parquet)
 - [CSV (gzipped)](https://data.foiforest.org/gazette/aps_gazette_vacancies.csv.gz)
+- [Metadata sidecar (JSON)](https://data.foiforest.org/gazette/aps_gazette_vacancies.meta.json) — build provenance and per-file SHA-256
+- [Changelog](https://data.foiforest.org/gazette/CHANGELOG.md) — dataset version history
 
 See [`docs/data_dictionary.md`](docs/data_dictionary.md) for column descriptions and known limitations.
+
+Each published release also embeds build metadata (dataset version, build timestamp, git SHA, tool versions) in the parquet and the sidecar JSON. A dated snapshot of every release is kept indefinitely under `snapshots/` — dated copies begin July 2026.
 
 This dataset records vacancy advertisements published in the APS Gazette. It represents agency hiring activity (positions advertised for recruitment) not workforce composition. Vacancy volumes and proportions reflect a combination of workforce growth, turnover replacement, and recruitment channel choices. They should not be interpreted as a proxy for agency staffing levels or workforce structure. For current APS workforce composition, see the [APSED headcount dataset](https://github.com/gjosling/apsed-public).
 
@@ -24,11 +28,11 @@ Scripts are numbered in execution order:
 | Script | What it does |
 |--------|-------------|
 | `01_download.py` | Probe the APSC S3 bucket for gazette PDFs and download them locally |
-| `02_parse.py` | Extract structured vacancy notices from each PDF using pdftotext; outcome notice PDFs are skipped |
+| `02_parse.py` | Extract structured vacancy notices from each PDF using pdftotext; outcome notice PDFs are skipped. Parse state (`data/parse_log.csv`) and the raw parquet are flushed together in batches; failed or missing PDFs are retried on the next run |
 | `03_normalise.py` | Derive salary_min/max, closing_date, duties_text, location_normalised, classification_clean |
 | `04_build_crosswalk.py` | Define agency name normalisations (MoG changes, renames, merges) |
 | `05_apply_crosswalk.py` | Apply the crosswalk with date-aware resolution |
-| `06_build_release.py` | Deduplicate (drop daily rows where a weekly version exists), validate, rename columns, convert gazette_date to date, write the release parquet |
+| `06_build_release.py` | Deduplicate (drop daily rows where a weekly version exists), run release validation (`pipeline/validation.py`, with bounds in the committed `data/expectations.json`) that **fails the build and blocks publication** on any failing check, rename columns, convert gazette_date to date, write the release parquet |
 | `07_clean_text.py` | Detect and strip agency boilerplate from `description`, producing `description_clean`; redact email addresses, phone numbers, and contact officer names from description fields; write `data/diagnostics/boilerplate_sentences.csv` as an audit trail |
 | `08_classify_job_family.py` | Classify each vacancy into one of 16 APSC 2025 Job Families using Claude (`claude-sonnet-4-6`) via the Anthropic Batch API. Only processes rows not already in `data/job_family_classifications.parquet`. |
 | `09_check_coverage.py` | Check the release parquet for null `agency_canonical` values (crosswalk gaps); emit GitHub Actions warning annotations and a job summary. Does not modify data. |
@@ -157,7 +161,9 @@ Most APS agencies will match cleanly on `agency_canonical`. Unmatched rows are e
 
 GitHub Actions runs the pipeline weekly (Fridays) and can be triggered manually via `workflow_dispatch`.
 
-R2 is used as the persistent state store across runs. At the start of each run, `r2_sync.py pull` restores the manifest, parse log, accumulated raw parquet, and job family classifications from R2 so the pipeline only processes new gazettes and new vacancies. After downloading, `r2_sync.py push-pdfs` archives any new PDFs to the private R2 bucket under `pdfs/` (already-archived PDFs are skipped). At the end, `r2_sync.py push` persists the updated state files (including classifications) and publishes the release parquet and CSV. PDFs are otherwise transient and are discarded when the runner exits.
+A validation step after parsing reconciles the parse log against the raw parquet; release checks in step 06 block publication on failure.
+
+R2 is used as the persistent state store across runs. At the start of each run, `r2_sync.py pull` restores the manifest, parse log, accumulated raw parquet, and job family classifications from R2 so the pipeline only processes new gazettes and new vacancies. After downloading, `r2_sync.py push-pdfs` archives any new PDFs to the private R2 bucket under `pdfs/` (already-archived PDFs are skipped). At the end, `r2_sync.py push` persists the updated state files (including classifications) and publishes the release parquet, CSV, metadata sidecar, and changelog. Uploads are compared by SHA-256: each object's local hash is checked against a `sha256` metadata value on the remote object, and a file whose hash already matches is skipped (R2/S3 ETags are not content hashes for multipart uploads, so they are not used). Each push also writes a dated snapshot of the published release under `snapshots/` (kept indefinitely; the sync never deletes). PDFs are otherwise transient and are discarded when the runner exits.
 
 CI requires eight repository secrets: `R2_ACCOUNT_ID` (shared), `R2_PRIVATE_ACCESS_KEY_ID`, `R2_PRIVATE_SECRET_ACCESS_KEY`, `R2_PRIVATE_BUCKET` (pipeline state, PDF archive, and job family classifications), `R2_PUBLIC_ACCESS_KEY_ID`, `R2_PUBLIC_SECRET_ACCESS_KEY`, `R2_PUBLIC_BUCKET` (release files), and `ANTHROPIC_API_KEY` (job family classification via Claude).
 

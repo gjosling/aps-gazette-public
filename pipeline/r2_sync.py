@@ -12,18 +12,31 @@ wrapper that bookends each run:
 
   push-pdfs  (after download) local → R2  Archive new PDFs to the private bucket
                                           under pdfs/. Idempotent — already-archived
-                                          PDFs are skipped by Content-Length check.
+                                          PDFs are skipped by sha256 comparison.
 
   push       (end of run)    local → R2  Persist updated state files and publish
-                                          the release parquet and CSV.
+                                          the release parquet, CSV, sidecar JSON and
+                                          changelog. Also writes a dated snapshot of
+                                          the published release (see below).
 
   pull-pdfs  (manual only)   R2 → local  Restore the full PDF archive from R2 to
                                           data/pdfs/. Used before a full reparse;
                                           never called in normal CI.
 
 Pull is graceful: missing objects (first run, or partial state) are skipped
-without error. Push is idempotent: files whose local size already matches the
-R2 Content-Length are skipped.
+without error. Push is idempotent: each object's local SHA-256 is compared with
+the `sha256` user-metadata stamped on the remote object (S3 ETags are not content
+hashes for multipart uploads, so they are not used); a file whose hash already
+matches the remote is skipped, otherwise it is uploaded with the hash stamped as
+metadata. Objects uploaded before this scheme existed have no sha256 metadata and
+re-upload once to become stamped.
+
+Dated snapshots (R2-versioning substitute): Cloudflare R2 has no object
+versioning, so after each push the release parquet, its sidecar JSON, and the
+private classifications parquet are additionally copied to
+snapshots/<name>-YYYYMMDD.<ext> (current UTC date). Re-running push the same day
+overwrites that day's snapshot — the last build of a day wins. Snapshots are kept
+indefinitely; this script deletes nothing, ever.
 
 Two buckets, separate credentials, shared Cloudflare account:
   Private  pipeline state (manifest, parse log, raw parquet) and PDF archive
@@ -46,8 +59,10 @@ Usage:
 """
 
 import argparse
+import hashlib
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
@@ -74,8 +89,10 @@ PUSH_PRIVATE = [
 
 # Push public: (local_path, r2_key)
 PUSH_PUBLIC = [
-    ("data/release/aps_gazette_vacancies.parquet", "gazette/aps_gazette_vacancies.parquet"),
-    ("data/release/aps_gazette_vacancies.csv.gz",  "gazette/aps_gazette_vacancies.csv.gz"),
+    ("data/release/aps_gazette_vacancies.parquet",   "gazette/aps_gazette_vacancies.parquet"),
+    ("data/release/aps_gazette_vacancies.csv.gz",    "gazette/aps_gazette_vacancies.csv.gz"),
+    ("data/release/aps_gazette_vacancies.meta.json", "gazette/aps_gazette_vacancies.meta.json"),
+    ("docs/CHANGELOG.md",                            "gazette/CHANGELOG.md"),
 ]
 
 # Multipart threshold: boto3 default is 8 MB.
@@ -116,9 +133,19 @@ def _pull_one(s3, bucket: str, r2_key: str, local: str, dry_run: bool) -> str:
         raise
 
 
-def _remote_size(s3, bucket: str, key: str) -> int | None:
+def _sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
+    """Stream the file in 1 MiB chunks and return its hex SHA-256."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _remote_sha256(s3, bucket: str, key: str) -> str | None:
+    """Return the `sha256` user-metadata stamped on the remote object, or None."""
     try:
-        return s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
+        return s3.head_object(Bucket=bucket, Key=key).get("Metadata", {}).get("sha256")
     except Exception:
         return None
 
@@ -129,14 +156,18 @@ def _push_one(s3, bucket: str, local: str, r2_key: str, dry_run: bool) -> str:
         return f"SKIP (not found locally): {local}"
 
     local_size = p.stat().st_size
-    if _remote_size(s3, bucket, r2_key) == local_size:
+    local_hash = _sha256_file(p)
+    if _remote_sha256(s3, bucket, r2_key) == local_hash:
         return f"skip (unchanged, {local_size / 1e6:.1f} MB): {r2_key}"
 
     mb = local_size / 1e6
     if dry_run:
         return f"would push ({mb:.1f} MB): {local} → {r2_key}"
 
-    s3.upload_file(Filename=str(p), Bucket=bucket, Key=r2_key, Config=TRANSFER_CFG)
+    s3.upload_file(
+        Filename=str(p), Bucket=bucket, Key=r2_key, Config=TRANSFER_CFG,
+        ExtraArgs={"Metadata": {"sha256": local_hash}},
+    )
     return f"pushed ({mb:.1f} MB): {r2_key}"
 
 
@@ -231,6 +262,23 @@ def push(dry_run: bool = False) -> None:
     print("  -- public --")
     for local, r2_key in PUSH_PUBLIC:
         msg = _push_one(s3_pub, bkt_pub, local, r2_key, dry_run)
+        print(f"  {msg}")
+        if msg.startswith("pushed"):
+            total_mb += Path(local).stat().st_size / 1e6
+
+    # ── Dated snapshots (R2-versioning substitute; kept indefinitely) ───────────
+    # After the normal pushes, copy the published release + sidecar (public) and
+    # the classifications parquet (private) to snapshots/<name>-YYYYMMDD.<ext>.
+    # Unconditional for the date: same-day re-runs overwrite that day's snapshot.
+    date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    snapshots = [
+        (s3_pub,  bkt_pub,  "data/release/aps_gazette_vacancies.parquet",   f"snapshots/aps_gazette_vacancies-{date}.parquet"),
+        (s3_pub,  bkt_pub,  "data/release/aps_gazette_vacancies.meta.json", f"snapshots/aps_gazette_vacancies-{date}.meta.json"),
+        (s3_priv, bkt_priv, "data/job_family_classifications.parquet",      f"snapshots/job_family_classifications-{date}.parquet"),
+    ]
+    print("  -- snapshots --")
+    for s3, bkt, local, r2_key in snapshots:
+        msg = _push_one(s3, bkt, local, r2_key, dry_run)
         print(f"  {msg}")
         if msg.startswith("pushed"):
             total_mb += Path(local).stat().st_size / 1e6

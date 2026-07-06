@@ -11,6 +11,44 @@ Both formats contain identical data.
 
 ---
 
+## Build metadata and versioning
+
+The parquet embeds file-level key-value metadata under `aps_gazette:*` keys. The
+same fields, plus a per-file SHA-256 of the parquet and CSV, are published as a
+sidecar JSON alongside the release files:
+[`aps_gazette_vacancies.meta.json`](https://data.foiforest.org/gazette/aps_gazette_vacancies.meta.json).
+The CSV cannot carry embedded metadata — use the sidecar for CSV provenance.
+
+| Field | Meaning |
+|-------|---------|
+| `dataset_version` | Semantic version of the dataset contract (see below). |
+| `build_timestamp_utc` | UTC ISO-8601 timestamp when this build wrote the file. |
+| `git_sha` | Pipeline commit that produced the build (`+dirty` if the tree had uncommitted changes; `unknown` if git was unavailable). |
+| `poppler_version` | Version string of the `pdftotext` (poppler) binary used to parse PDFs. |
+| `boilerplate_method_version` | Version of the boilerplate-stripping method in `07_clean_text.py`. |
+| `job_family_prompt_version` | Version of the job-family classification prompt in `08_classify_job_family.py`. |
+| `pipeline_stage` | Which pipeline step last wrote the file (`06_build_release`, `07_clean_text`, or `08_classify_job_family`). |
+| `row_count` | Number of rows in the file. |
+
+**`dataset_version` policy** (semantic-ish versioning of the *dataset contract*, not the code):
+
+- **MAJOR** — a column is removed/renamed or its meaning changes incompatibly.
+- **MINOR** — new columns, or a deliberate retroactive change to published values (crosswalk correction, boilerplate method change, MoG re-attribution) — anything that makes "the same query returns different numbers" true.
+- **PATCH** — routine weekly appends and bug fixes affecting only rows added since the last version.
+
+Routine weekly CI runs do not bump the version — `build_timestamp_utc` and `git_sha`
+distinguish individual builds. See the [changelog](https://data.foiforest.org/gazette/CHANGELOG.md)
+for the version history.
+
+### Snapshots
+
+Because Cloudflare R2 has no object versioning, a dated copy of each published
+release is kept at `snapshots/aps_gazette_vacancies-YYYYMMDD.parquet` (and a matching
+`.meta.json`). Snapshots are kept indefinitely. They begin in July 2026 — earlier
+published versions were not archived and are not recoverable.
+
+---
+
 ## Column reference
 
 ### Provenance
@@ -33,6 +71,23 @@ Both formats contain identical data.
 | `agency_group` | string | Stable grouping label for longitudinal analysis across MoG changes. Renames and clear-successor cases share a group; genuine functional splits get separate groups. See Notes below. |
 
 **`agency_group` grouping logic:** For renames and cases with a clear functional successor, predecessor and successor share a group (e.g. DAWE and DAFF both map to `"Agriculture department"`). For genuine functional splits, the split-off entity gets its own group. The two major splits in this dataset: DAWE→DAFF+DCCEEW (DAWE and DAFF share a group; DCCEEW does not) and DESE→Education+DEWR (DESE and Department of Education share a group; DEWR does not). These are not fully bridged by `agency_group`.
+
+### Agency attribution convention
+
+Attribution follows the **employing entity** as printed in the gazette header. Where a notice is printed under a portfolio-host header but the `division` field names a distinct body, the row is attributed to the employing entity, not the sub-entity — unless the sub-entity is a deliberate exception (below).
+
+**Deliberate sub-entity exceptions**, where the sub-entity is the analytically meaningful unit and attribution is to the sub-entity rather than the host:
+
+- Australian Institute of Family Studies (AIFS)
+- National Disability Insurance Agency (NDIA)
+- Office of the eSafety Commissioner
+- the `BRANCH_OVERRIDE_PAIRS` bodies: Parliamentary Workplace Support Service; Independent Health and Aged Care Pricing Authority / Independent Hospital Pricing Authority; National Mental Health Commission; Australian Centre for Disease Control; Domestic, Family and Sexual Violence Commission; Australian Submarine Agency; Australian Naval Nuclear Power Safety Regulator
+
+FCFCoA and NNTT rows are attributed to the **Federal Court of Australia** (their employing entity) even though `division` names the court/tribunal — the largest such family (~375 rows).
+
+A future `division_entity` column could expose sub-entities without changing attribution; it is explicitly **out of scope** for now.
+
+The convention is enforced at build time by the division-mismatch check (`pipeline/validation.py` check 2) against `ALLOWED_DIVISION_MISMATCH` in `pipeline/04_build_crosswalk.py`: any release row whose `division` starts with a canonical agency name differing from `agency_canonical` must appear in that allowlist, or the build fails.
 
 ### Role details
 

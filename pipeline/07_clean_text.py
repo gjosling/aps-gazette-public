@@ -53,9 +53,19 @@ from pathlib import Path
 
 import pandas as pd
 
+# validation.py is a legal module name; make it importable by adding the
+# pipeline/ dir to sys.path (the numerically-prefixed pipeline scripts can't be).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import validation
+import release_io
+
 PARQUET_PATH  = Path("data/release/aps_gazette_vacancies.parquet")
 CSV_PATH      = Path("data/release/aps_gazette_vacancies.csv.gz")
 AUDIT_CSV     = Path("data/diagnostics/boilerplate_sentences.csv")
+
+# Version of the boilerplate-stripping method, stamped into release metadata by
+# release_io.build_metadata. Spec 05 bumps this to "2026-07-v2".
+BOILERPLATE_METHOD_VERSION = "2025-v1"
 
 DEFAULT_THRESHOLD  = 0.30
 DEFAULT_MIN_TITLES = 3
@@ -378,14 +388,26 @@ def run(threshold: float, min_title_diversity: int, dry_run: bool) -> None:
         print("[dry-run] not writing parquet/csv output")
         return
 
-    df.to_parquet(PARQUET_PATH, index=False)
-    df.to_csv(CSV_PATH, index=False, compression="gzip")
+    release_io.write_release(df, "07_clean_text")
 
     p_mb = os.path.getsize(PARQUET_PATH) / 1e6
     c_mb = os.path.getsize(CSV_PATH)     / 1e6
     print(f"Saved → {PARQUET_PATH}  ({p_mb:.1f} MB)")
     print(f"Saved → {CSV_PATH}  ({c_mb:.1f} MB)")
     print(f"\nDone. {len(df):,} rows, {len(df.columns)} columns.")
+
+    # ── Validation ──────────────────────────────────────────────────────────────
+    #
+    # description_clean now exists, so this is where the boilerplate-residual check
+    # (check 6) actually runs. A FAIL blocks publication: exit 1 so CI stops before
+    # 08/push. The locally rewritten release files are already on disk, which is
+    # acceptable — publication is what the gate protects.
+    print()
+    expectations = validation.load_expectations()
+    findings = validation.validate_release(df, expectations)
+    if validation.has_fail(findings):
+        print("\nRelease BLOCKED: validation FAILed. Not publishing; CI stops before 08/push.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

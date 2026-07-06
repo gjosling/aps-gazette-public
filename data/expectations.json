@@ -1,0 +1,16 @@
+{
+  "_policy": "Bounds are deliberate maintainer commitments, never auto-updated. To refresh: run `python pipeline/validation.py --print-current`, review the diff, edit this file by hand, and commit with a message explaining why the bound moved. A validation FAIL is never fixed by silently relaxing a bound.",
+  "updated": "2026-07-06",
+  "min_release_rows": 87000,
+  "min_agency_rows": {
+    "Australian Institute of Family Studies": 118,
+    "Office of the eSafety Commissioner": 196
+  },
+  "max_agency_canonical_nulls": 2,
+  "boilerplate_residual": {
+    "phrase": "employed under other Acts",
+    "since": "2025-07-01",
+    "max_pct_of_descriptions_clean": 6.0
+  },
+  "am_linkage": null
+}

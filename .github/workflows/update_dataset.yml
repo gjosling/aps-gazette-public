@@ -44,6 +44,9 @@ jobs:
       - name: Parse PDFs
         run: uv run python pipeline/02_parse.py batch
 
+      - name: Validate raw parse
+        run: uv run python pipeline/validation.py --raw
+
       - name: Normalise fields
         run: uv run python pipeline/03_normalise.py
 

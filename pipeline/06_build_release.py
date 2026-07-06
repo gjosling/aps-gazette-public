@@ -9,8 +9,16 @@ ensures duties_text follows description, then writes:
 """
 
 import os
-import re
+import sys
+from pathlib import Path
+
 import pandas as pd
+
+# validation.py is a legal module name; make it importable by adding the
+# pipeline/ dir to sys.path (the numerically-prefixed pipeline scripts can't be).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import validation
+import release_io
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 
@@ -102,114 +110,18 @@ def run():
     print("gazette_date: converted to date")
 
     # ── Validation ────────────────────────────────────────────────────────────────
+    #
+    # Checks live in pipeline/validation.py and their bounds in the committed
+    # data/expectations.json. A FAIL blocks publication: we exit 1 here so CI
+    # stops before 07/08/push. Check 6 (boilerplate residual) is skipped here —
+    # description_clean does not exist yet — and runs at the end of 07_clean_text.py.
 
-    ERRORS = []
-
-    def ok(label):
-        print(f"  OK    {label}")
-
-    def fail(label, detail=''):
-        msg = f"FAIL  {label}" + (f"  [{detail}]" if detail else '')
-        ERRORS.append(msg)
-        print(f"  {msg}")
-
-    print("\n=== VALIDATION ===")
-
-    # Row count — sanity lower bound only (dedup reduces count variably)
-    # Lower bound based on dataset as of Jan 2026; bump as the dataset grows.
-    if len(df) >= 50_000:
-        ok(f"row count = {len(df):,}")
-    else:
-        fail("row count", f"got {len(df):,}, expected >= 50,000")
-
-    # agency_canonical nulls — crosswalk gaps are expected occasionally; reported as
-    # warnings (not failures) by 09_check_coverage.py at the end of the pipeline.
-    n = df['agency_canonical'].isna().sum()
-    ok(f"agency_canonical nulls = {n}")
-
-    # eSafety row count — lower bound (grows as new notices are ingested)
-    # Lower bound based on dataset as of Jan 2026; bump as the dataset grows.
-    n = (df['agency_canonical'] == 'Office of the eSafety Commissioner').sum()
-    if n >= 196:
-        ok(f"eSafety rows = {n}")
-    else:
-        fail("eSafety rows", f"got {n}, expected >= 196")
-
-    # gazette_type values — allow 'daily' in addition to renamed weekly types
-    ALLOWED_TYPES = {'combined', 'vacancy_only', 'daily'}
-    gt_vals = set(df['gazette_type'].dropna().unique())
-    unexpected = gt_vals - ALLOWED_TYPES
-    if not unexpected:
-        ok(f"gazette_type values = {sorted(gt_vals)}")
-    else:
-        fail("gazette_type values", f"unexpected: {unexpected}")
-
-    # No salary_min > salary_max
-    inverted = df['salary_min'].notna() & df['salary_max'].notna() & (df['salary_min'] > df['salary_max'])
-    n = inverted.sum()
-    if n == 0:
-        ok("no salary_min > salary_max")
-    else:
-        fail("salary_min > salary_max", f"{n} rows")
-
-    # No salary > 500k
-    for col in ['salary_min', 'salary_max']:
-        n = (df[col] > 500_000).sum()
-        if n == 0:
-            ok(f"no {col} > 500k")
-        else:
-            fail(f"{col} > 500k", f"{n} rows")
-
-    # location_normalised populated where location is non-null
-    mismatch = df['location'].notna() & df['location_normalised'].isna()
-    n = mismatch.sum()
-    if n == 0:
-        ok("location_normalised populated where location is non-null")
-    else:
-        fail("location_normalised gaps", f"{n} rows")
-
-    # No YYYY.pdf in division
-    n = df['division'].str.contains(r'\d{4}\.pdf', na=False, regex=True).sum()
-    if n == 0:
-        ok("no YYYY.pdf in division")
-    else:
-        fail("YYYY.pdf in division", f"{n} rows")
-
-    # No Portfolio) in division
-    n = df['division'].str.contains(r'Portfolio\)', na=False, regex=False).sum()
-    if n == 0:
-        ok("no Portfolio) in division")
-    else:
-        fail("Portfolio) in division", f"{n} rows")
-
-    # No field-bleed double-space pattern in structured fields
-    bleed_re = r'\S  [A-Z][a-z]'
-    for col in ['agency', 'division', 'branch', 'job_title', 'classification', 'position_number']:
-        if col not in df.columns:
-            continue
-        n = df[col].dropna().str.contains(bleed_re, regex=True).sum()
-        if n == 0:
-            ok(f"no bleed pattern in {col}")
-        else:
-            fail(f"bleed pattern in {col}", f"{n} rows")
-
-    # No empty strings in any string column
-    str_cols = df.select_dtypes(include=['object', 'string']).columns.tolist()
-    total_empty = sum((df[col] == '').sum() for col in str_cols)
-    if total_empty == 0:
-        ok(f"no empty strings across {len(str_cols)} string columns")
-    else:
-        for col in str_cols:
-            n = (df[col] == '').sum()
-            if n:
-                fail(f"empty strings in {col}", f"{n} rows")
-
-    # Summary
     print()
-    if ERRORS:
-        print(f"VALIDATION: {len(ERRORS)} failure(s)")
-    else:
-        print("VALIDATION: all checks passed")
+    expectations = validation.load_expectations()
+    findings = validation.validate_release(df, expectations)
+    if validation.has_fail(findings):
+        print("\nRelease BLOCKED: validation FAILed. Not publishing; CI stops before 07/08/push.")
+        sys.exit(1)
 
     # ── Column summary ────────────────────────────────────────────────────────────
 
@@ -227,8 +139,7 @@ def run():
     PARQUET_OUT = 'data/release/aps_gazette_vacancies.parquet'
     CSV_OUT     = 'data/release/aps_gazette_vacancies.csv.gz'
 
-    df.to_parquet(PARQUET_OUT, index=False)
-    df.to_csv(CSV_OUT, index=False, compression='gzip')
+    release_io.write_release(df, "06_build_release")
 
     p_mb = os.path.getsize(PARQUET_OUT) / 1e6
     c_mb = os.path.getsize(CSV_OUT) / 1e6

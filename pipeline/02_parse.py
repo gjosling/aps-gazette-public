@@ -16,9 +16,17 @@ Usage:
     python pipeline/02_parse.py single <input.pdf> <gazette_id> <date YYYY-MM-DD> <output.csv>
 
 Batch mode reads data/manifest.csv (produced by 01_download.py), skips files
-already recorded in data/parse_log.csv, and appends new records to
-data/gazette_vacancies_raw.parquet. Safe to interrupt — parse_log.csv is
-updated after each PDF so a restarted run picks up where it left off.
+whose latest parse-log entry is `parsed`, and appends new records to
+data/gazette_vacancies_raw.parquet. Files logged `missing_pdf` or `error` are
+retried on every run (last-status-wins in the append-only log), so a transient
+failure is no longer a permanent skip.
+
+Safe to interrupt: the raw parquet and parse_log.csv are flushed together every
+100 successfully parsed PDFs (FLUSH_EVERY) and once at end of run. The parquet
+is written first (atomically, via a .tmp file + os.replace), and the batch's
+pending log rows are appended only after to_parquet returns. An interrupted run
+therefore loses at most the last unflushed batch of both artefacts together, and
+the next run redoes exactly those PDFs.
 
 Pass --full to ignore the parse log and reparse every PDF in data/pdfs/,
 replacing any existing parquet. Use this after parser changes to rebuild from
@@ -45,6 +53,7 @@ Known limitations:
 
 import argparse
 import csv
+import os
 import re
 import subprocess
 import sys
@@ -58,6 +67,10 @@ MANIFEST_PATH  = Path("data/manifest.csv")
 PARSE_LOG_PATH = Path("data/parse_log.csv")
 PARQUET_PATH   = Path("data/gazette_vacancies_raw.parquet")
 PDF_DIR        = Path("data/pdfs")
+
+# Flush the raw parquet and parse log together every this-many successfully
+# parsed PDFs (see parse_gazette_batch). Bounds the crash-loss window.
+FLUSH_EVERY = 100
 
 PARSE_LOG_FIELDS = [
     "filename", "gazette_date", "gazette_id", "gazette_type",
@@ -463,11 +476,21 @@ def write_csv(records, output_path):
         writer.writerows(records)
 
 def _load_parse_log() -> set[str]:
-    """Return set of filenames already recorded in the parse log."""
+    """Return the set of filenames whose *latest* parse-log entry is `parsed`.
+
+    The log is append-only, so a filename can appear more than once (e.g. a
+    `missing_pdf` row followed later by a `parsed` row after retry). Reading in
+    order and keeping the last status per filename makes retries recordable:
+    only files that most recently succeeded are treated as done and skipped.
+    `missing_pdf`/`error` files fall through and are retried on the next run.
+    """
     if not PARSE_LOG_PATH.exists():
         return set()
+    latest: dict[str, str] = {}
     with open(PARSE_LOG_PATH, newline='', encoding='utf-8') as f:
-        return {row['filename'] for row in csv.DictReader(f)}
+        for row in csv.DictReader(f):
+            latest[row['filename']] = row['status']
+    return {fn for fn, status in latest.items() if status == 'parsed'}
 
 
 def _append_parse_log(row: dict) -> None:
@@ -480,11 +503,36 @@ def _append_parse_log(row: dict) -> None:
             writer.writeheader()
         writer.writerow(row)
 
+
+def _rewrite_parse_log_deduped() -> None:
+    """Rewrite parse_log.csv keeping only the last entry per filename.
+
+    Ordered by (gazette_date, filename). Bounds log growth from repeatedly
+    retried failures and drops rows superseded by a later status. Called only
+    at end of run, immediately after the final parquet write, so the full
+    rewrite can never leave the log ahead of persisted data.
+    """
+    if not PARSE_LOG_PATH.exists():
+        return
+    latest: dict[str, dict] = {}
+    with open(PARSE_LOG_PATH, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            latest[row['filename']] = row
+    rows = sorted(latest.values(), key=lambda r: (r['gazette_date'], r['filename']))
+    tmp = Path(str(PARSE_LOG_PATH) + '.tmp')
+    with open(tmp, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=PARSE_LOG_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, PARSE_LOG_PATH)
+
 def parse_gazette_batch(batch_size: int | None = None, full: bool = False) -> None:
     """
     Parse gazette PDFs and write records to gazette_vacancies_raw.parquet.
 
-    Incremental (default): skips files already in parse_log.csv, appends to parquet.
+    Incremental (default): skips files whose latest parse-log entry is `parsed`;
+    files logged `missing_pdf`/`error` are retried. Parquet and parse_log are
+    flushed together every FLUSH_EVERY PDFs (see module docstring).
     Full (--full): ignores parse_log, reparsing every PDF in data/pdfs/ and
     replacing the existing parquet. Use after parser changes.
     """
@@ -528,13 +576,50 @@ def parse_gazette_batch(batch_size: int | None = None, full: bool = False) -> No
     existing_df = None
     if not full and PARQUET_PATH.exists():
         existing_df = pd.read_parquet(PARQUET_PATH)
+        existing_df['gazette_date'] = pd.to_datetime(existing_df['gazette_date'])
         print(f"Existing parquet:             {len(existing_df):,} rows")
     elif full and PARQUET_PATH.exists():
         print(f"Full reparse: replacing {PARQUET_PATH}")
 
+    # `new_records` accumulates across the whole run; each flush rewrites the
+    # full combined parquet (existing + all new records so far). `pending_log`
+    # holds log rows not yet written; they are appended only after the parquet
+    # write, so the log can never run ahead of persisted data.
     new_records: list[dict] = []
+    pending_log: list[dict] = []
     n_parsed  = 0
     n_errors  = 0
+    n_since_flush = 0
+
+    def flush(final: bool) -> None:
+        """Persist parquet (if there are new records), then the pending log rows.
+
+        Parquet first (atomic .tmp + os.replace), log after — never the reverse.
+        The end-of-run flush additionally rewrites the log deduplicated to the
+        last status per filename.
+        """
+        if new_records:
+            new_df = pd.DataFrame(new_records)
+            new_df['gazette_date'] = pd.to_datetime(new_df['gazette_date'])
+            if existing_df is not None:
+                combined = pd.concat([existing_df, new_df], ignore_index=True)
+            else:
+                combined = new_df
+            combined = combined.sort_values(
+                ['gazette_date', 'vacancy_no'], na_position='last'
+            ).reset_index(drop=True)
+            PARQUET_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = Path(str(PARQUET_PATH) + '.tmp')
+            combined.to_parquet(tmp, index=False)
+            os.replace(tmp, PARQUET_PATH)
+
+        # Only after the parquet is safely on disk do we touch the log.
+        for log_row in pending_log:
+            _append_parse_log(log_row)
+        pending_log.clear()
+
+        if final:
+            _rewrite_parse_log_deduped()
 
     for _, row in pending.iterrows():
         filename    = row['filename']
@@ -545,7 +630,7 @@ def parse_gazette_batch(batch_size: int | None = None, full: bool = False) -> No
 
         if not pdf_path.exists():
             print(f"  MISSING PDF: {filename}", file=sys.stderr)
-            _append_parse_log({
+            pending_log.append({
                 'filename':     filename,
                 'gazette_date': gazette_date,
                 'gazette_id':   gazette_id,
@@ -561,7 +646,7 @@ def parse_gazette_batch(batch_size: int | None = None, full: bool = False) -> No
             records, vn_count = parse_gazette(str(pdf_path), gazette_id, gazette_date)
         except Exception as e:
             print(f"  ERROR {filename}: {e}", file=sys.stderr)
-            _append_parse_log({
+            pending_log.append({
                 'filename':     filename,
                 'gazette_date': gazette_date,
                 'gazette_id':   gazette_id,
@@ -579,6 +664,7 @@ def parse_gazette_batch(batch_size: int | None = None, full: bool = False) -> No
 
         new_records.extend(records)
         n_parsed += 1
+        n_since_flush += 1
 
         drop_note = ''
         if len(records) < vn_count:
@@ -586,7 +672,7 @@ def parse_gazette_batch(batch_size: int | None = None, full: bool = False) -> No
         print(f"  {gazette_date}  {gazette_id}  {gazette_type:15s}  "
               f"{len(records):3d}/{vn_count} notices{drop_note}")
 
-        _append_parse_log({
+        pending_log.append({
             'filename':     filename,
             'gazette_date': gazette_date,
             'gazette_id':   gazette_id,
@@ -596,30 +682,16 @@ def parse_gazette_batch(batch_size: int | None = None, full: bool = False) -> No
             'status':       'parsed',
         })
 
-    if not new_records:
-        print(f"\nParsed {n_parsed} PDFs (0 new records).")
-        if n_errors:
-            print(f"Errors: {n_errors}", file=sys.stderr)
-        return
+        if n_since_flush >= FLUSH_EVERY:
+            flush(final=False)
+            n_since_flush = 0
 
-    new_df = pd.DataFrame(new_records)
-    new_df['gazette_date'] = pd.to_datetime(new_df['gazette_date'])
+    flush(final=True)
 
-    if existing_df is not None:
-        existing_df['gazette_date'] = pd.to_datetime(existing_df['gazette_date'])
-        combined = pd.concat([existing_df, new_df], ignore_index=True)
-    else:
-        combined = new_df
-
-    combined = combined.sort_values(
-        ['gazette_date', 'vacancy_no'], na_position='last'
-    ).reset_index(drop=True)
-
-    PARQUET_PATH.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(PARQUET_PATH, index=False)
-
+    total_rows = (len(existing_df) if existing_df is not None else 0) + len(new_records)
     print(f"\nParsed {n_parsed} PDFs  +{len(new_records):,} records")
-    print(f"Total in parquet: {len(combined):,} rows → {PARQUET_PATH}")
+    if new_records:
+        print(f"Total in parquet: {total_rows:,} rows → {PARQUET_PATH}")
     if n_errors:
         print(f"Errors: {n_errors}", file=sys.stderr)
 

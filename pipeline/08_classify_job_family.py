@@ -34,6 +34,11 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).parent.parent
 load_dotenv(ROOT / ".env")
 
+# release_io is a legal module name; make it importable by adding the pipeline/
+# dir to sys.path (the numerically-prefixed pipeline scripts can't be).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import release_io
+
 PARQUET_PATH          = Path("data/release/aps_gazette_vacancies.parquet")
 CSV_PATH              = Path("data/release/aps_gazette_vacancies.csv.gz")
 CLASSIFICATIONS_PATH  = Path("data/job_family_classifications.parquet")
@@ -351,9 +356,8 @@ def join_and_write_release(df: pd.DataFrame, clf: pd.DataFrame) -> None:
     print("\n=== WRITE RELEASE ===")
     n_classified = df["job_family"].notna().sum()
     print(f"  job_family populated: {n_classified:,} / {len(df):,} rows")
-    df.to_parquet(PARQUET_PATH, index=False)
+    release_io.write_release(df, "08_classify_job_family")
     print(f"  Written: {PARQUET_PATH}")
-    df.to_csv(CSV_PATH, index=False, compression="gzip")
     print(f"  Written: {CSV_PATH}")
 
 

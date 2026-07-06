@@ -674,6 +674,98 @@ AGENCY_GROUP = {
 
 
 # ============================================================
+# SECTION 5b — DIVISION-MISMATCH ALLOWLIST
+#
+# Used by pipeline/validation.py check 2 (the AIFS-class regression guard).
+# For each release row whose `division` string starts with a canonical agency
+# name (longest-prefix match against CANONICAL_AGENCIES, minus the two stale
+# pre-MoG names collapsed by CANONICAL_REMAP in 05_apply_crosswalk.py) that
+# DIFFERS from the row's `agency_canonical`, the ordered pair
+# (agency_canonical, division_canonical) must appear here. Any unlisted pair
+# FAILs the build — this is what would have caught the AIFS misattribution.
+#
+# Seeded with exactly the 27 pairs (583 rows) observed in the 2026-07-06
+# release under the module prefix pool. Each entry is a deliberate
+# employing-entity/sub-entity convention, a prefix-matcher false positive, or a
+# TEMPORARY single-row misattribution flagged for spec 07. Do NOT add entries
+# without row-level evidence.
+# ============================================================
+
+ALLOWED_DIVISION_MISMATCH = {
+    # Employing-entity convention: Federal Court is the employing entity for
+    # FCFCoA and NNTT staff; division names the court/tribunal (376 rows:
+    # 322 + 52 + 1 + 1 across the four pairs).
+    ("Federal Court of Australia", "Federal Circuit and Family Court of Australia"),
+    ("Federal Court of Australia", "National Native Title Tribunal"),
+    ("Federal Circuit and Family Court of Australia", "National Native Title Tribunal"),
+    ("National Native Title Tribunal", "Federal Court of Australia"),
+    # Deliberate sub-entity exceptions: division names the *hosting* body,
+    # canonical is the analytically meaningful sub-entity (BRANCH_OVERRIDE_PAIRS).
+    ("Parliamentary Workplace Support Service", "Australian Public Service Commission"),
+    ("Domestic, Family and Sexual Violence Commission", "Department of Social Services"),
+    ("Independent Health and Aged Care Pricing Authority", "Department of Health, Disability and Ageing"),
+    ("Independent Health and Aged Care Pricing Authority", "Department of Health and Aged Care"),
+    ("Independent Hospital Pricing Authority", "Department of Health and Aged Care"),
+    ("National Mental Health Commission", "Department of Health, Disability and Ageing"),
+    ("Office of the eSafety Commissioner", "Australian Communications and Media Authority"),
+    ("Australian Centre for Disease Control", "Department of Health and Aged Care"),
+    ("Australian Submarine Agency", "Department of Defence"),
+    ("Australian Naval Nuclear Power Safety Regulator", "Department of Defence"),
+    # Prefix-match false positive of THIS CHECK, not an attribution issue:
+    # 2 IHACPA rows (VN-0735741, VN-0735755, gazette 2024-02-08) whose *internal*
+    # division is literally named "Independent Hospital Pricing Authority Division"
+    # (a unit of IHACPA named after its predecessor). Attribution is correct;
+    # the longest-prefix matcher fires on the predecessor's canonical name.
+    ("Independent Health and Aged Care Pricing Authority", "Independent Hospital Pricing Authority"),
+    # Portfolio-department hosts: department is the employing entity, division
+    # names a portfolio body it advertised on behalf of (single-digit rows each;
+    # underlying rows verified 2026-07-06, see per-pair notes).
+    ("Department of the Treasury", "Royal Australian Mint"),
+    ("Department of the Treasury", "Australian Charities and Not-for-profits Commission"),
+    # 1 row: VN-0687359, 2021-03-18, "Second Commissioner of Taxation",
+    # classification_code = "Statutory Appointment". A statutory-office
+    # appointment run by the portfolio department, not an ATO staff vacancy —
+    # employing-entity attribution to Treasury is deliberate. NOT the AIFS
+    # shape (that was bulk staff-vacancy misattribution).
+    ("Department of the Treasury", "Australian Taxation Office"),
+    ("Department of the Treasury", "Infrastructure and Project Financing Agency"),
+    ("Department of the Treasury", "Productivity Commission"),
+    ("Department of Employment and Workplace Relations", "Comcare"),
+    ("Department of Agriculture, Water and the Environment", "Sydney Harbour Federation Trust"),
+    ("Department of Health", "Therapeutic Goods Administration"),
+    # 143 rows (2020→present): AER is a constituent part of the ACCC; AER staff
+    # are ACCC employees under the PS Act. Employing-entity convention, same as
+    # Federal Court/NNTT. (AER currently has 0 rows as its own canonical; the
+    # MANUAL_OVERRIDES that would map combined "ACCC ... AER" agency strings to
+    # AER match no current raw strings.)
+    ("Australian Competition and Consumer Commission", "Australian Energy Regulator"),
+    # 7 rows: division carries the agency's pre-rename name (Asbestos Safety and
+    # Eradication Agency → Asbestos and Silica Safety and Eradication Agency);
+    # attribution is correct, the prefix matcher fires on the old name.
+    ("Asbestos and Silica Safety and Eradication Agency", "Asbestos Safety and Eradication Agency"),
+    # ── TEMPORARY entries: known single-row misattributions, allowlisted only
+    # so this check can land green before the fix. Spec 07 item 7 reattributes
+    # both rows and DELETES these two pairs. Do not add new entries here
+    # without row-level evidence.
+    #
+    # 1 row: VN-0704814, 2022-05-05, "Executive Assistant - APS 6", raw agency
+    # = APSC, division = PWSS, branch null. Contemporaneous PWSS stand-up ads
+    # (Feb–Dec 2022, raw agency "Prime Minister and Cabinet", PWSS in branch)
+    # resolve to PWSS via BRANCH_OVERRIDE_PAIRS; this one names PWSS in
+    # *division*, which no pass inspects for a non-portfolio raw agency, so it
+    # stays on the host. Under the documented PWSS sub-entity exception it
+    # should be PWSS.
+    ("Australian Public Service Commission", "Parliamentary Workplace Support Service"),
+    # 1 row: VN-0700097, 2022-02-03, "Finance Officer", branch = "Office of
+    # the CEO", division = IHPA, raw agency = TGA (printed that way in the
+    # source PDF — verified against the raw parquet; fields parsed cleanly,
+    # so this is a gazette-source error, not a parse artefact). The role is
+    # plainly IHPA's; TGA and IHPA are unrelated bodies.
+    ("Therapeutic Goods Administration", "Independent Hospital Pricing Authority"),
+}
+
+
+# ============================================================
 # SECTION 6 — NORMALISATION AND MATCHING
 # ============================================================
 
