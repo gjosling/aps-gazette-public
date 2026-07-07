@@ -32,6 +32,12 @@ import requests
 BASE_URL = "https://s3-ap-southeast-2.amazonaws.com/apsc.gazette/"
 EARLIEST_DATE = date(2020, 1, 1)
 
+# Recent not_found dates are re-probed for this many days before becoming a
+# permanent skip, so a PDF uploaded by APSC after the initial CI probe is not
+# invisible forever. A gap date is re-probed on each run within the window (once
+# a week under weekly CI ≈ four extra HEAD requests), then skipped for good.
+REPROBE_WINDOW_DAYS = 28
+
 MANIFEST_PATH = Path("data/manifest.csv")
 PDF_DIR = Path("data/pdfs")
 
@@ -170,10 +176,20 @@ def run_download(
 
     manifest = _load_manifest()
 
-    # Skip dates already recorded in the manifest (any status).
+    # Skip dates already recorded in the manifest — EXCEPT recent not_found dates,
+    # which are re-probed for REPROBE_WINDOW_DAYS so a PDF uploaded by APSC after
+    # the initial probe is not invisible forever. A not_found date whose
+    # gazette_date falls within the window (>= today - REPROBE_WINDOW_DAYS) is left
+    # out of probed_dates and re-probed; older not_found dates and all typed
+    # entries stay skipped.
     probed_dates: set[str] = set()
     if skip_probed:
-        probed_dates = {row["gazette_date"] for row in manifest.values()}
+        reprobe_cutoff = date.today() - timedelta(days=REPROBE_WINDOW_DAYS)
+        for row in manifest.values():
+            if (row["status"] == "not_found"
+                    and date.fromisoformat(row["gazette_date"]) >= reprobe_cutoff):
+                continue   # recent not-found: re-probe this run
+            probed_dates.add(row["gazette_date"])
 
     print(f"Range:   {date_start} to {date_end}")
     print(f"Mode:    {'probe only (manifest not updated)' if probe_only else 'probe + download'}")
@@ -269,6 +285,11 @@ def run_download(
                     "status":       "not_found",
                 }
                 n_missing += 1
+            else:
+                # A re-probe that now finds PDFs: drop any stale not_found
+                # sentinel for this date, else manifest.update would leave the
+                # orphaned (date, "none") row alongside the new typed entries.
+                manifest.pop((date_str, "none"), None)
 
             manifest.update(date_entries)
             # Save after every date — safe to interrupt and resume

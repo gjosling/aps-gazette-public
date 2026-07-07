@@ -21,7 +21,7 @@ Per-agency pass:
    in that bin — this prevents bulk-recruitment templates (same role posted to many
    locations) from being mistaken for cross-role boilerplate.
 
-Global pass (spec 05, review finding F4): the per-agency method can never learn
+Global pass (review finding F4): the per-agency method can never learn
 gazette-wide template text for small agencies (their bins fall below MIN_BIN). A
 corpus-level pass bins ALL ads by half-year and flags a normalised sentence when,
 in any bin (≥ GLOBAL_MIN_BIN_ADS ads), it appears in ≥ GLOBAL_THRESHOLD of the
@@ -83,7 +83,7 @@ AUDIT_CSV     = AUDIT_DIR / "boilerplate_sentences.csv"   # stable name (diff wo
 # the .meta.json sidecar) and used in the dated audit-CSV filename. BUMP THIS
 # constant on ANY change to the thresholds, sentence splitting/normalisation, or
 # pass structure — it is the only marker that description_clean was recomputed by a
-# different method. Spec 05 bumped v1 → v2 (added the global corpus-wide pass).
+# different method. v2 added the global corpus-wide pass (bumped from v1).
 BOILERPLATE_METHOD_VERSION = "2026-07-v2"
 
 DEFAULT_THRESHOLD  = 0.30
@@ -91,7 +91,7 @@ DEFAULT_MIN_TITLES = 3
 MIN_BIN            = 10      # bins smaller than this are never used for flagging
 BIN_PERIOD         = "2Q"    # half-year (change to "Q" for quarterly)
 
-# Global (corpus-wide) pass — spec 05. Bins ALL ads by half-year; no MIN_BIN needed
+# Global (corpus-wide) pass. Bins ALL ads by half-year; no MIN_BIN needed
 # (every half-year bin has thousands of ads), but degenerate partial periods are
 # skipped via GLOBAL_MIN_BIN_ADS.
 DEFAULT_GLOBAL_THRESHOLD  = 0.40   # ≥40% of a corpus bin; below this, one dominant
@@ -297,7 +297,7 @@ def build_global_boilerplate_set(
     min_bin_ads: int = GLOBAL_MIN_BIN_ADS,
 ) -> tuple[frozenset[str], list[dict]]:
     """
-    Corpus-level boilerplate pass (spec 05 / review F4). Bins ALL ads (no agency
+    Corpus-level boilerplate pass (review finding F4). Bins ALL ads (no agency
     split) by half-year and returns the set of normalised sentences that, in any
     qualifying bin (≥ min_bin_ads ads):
       - appear in ≥ global_threshold fraction of that bin's ads, AND
@@ -449,7 +449,7 @@ def run(
     print(f"  {g_rescued:,} rescued by title-diversity guard (< {global_min_titles} distinct titles)")
     print(f"  {len(global_bp):,} sentences flagged globally (apply to EVERY agency)\n")
 
-    # Guard 2 (spec 05): print the full __GLOBAL__ flagged-sentence list for human
+    # Guard 2: print the full __GLOBAL__ flagged-sentence list for human
     # review. Anything role-specific here means GLOBAL_THRESHOLD is too low.
     flagged_global_audit = sorted(
         (r for r in global_audit_rows if r["flagged"]),
@@ -503,7 +503,7 @@ def run(
     # Both files carry the same content (per-agency + __GLOBAL__ rows). The stable
     # name keeps diff workflows working; the dated archive (method version + build
     # date, UTC) preserves the audit for each method version. Local files only —
-    # no R2 push (spec-05 decision: the audit is deterministic and regenerable).
+    # no R2 push (the audit is deterministic and regenerable, so it is not published).
 
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
     audit_df = (

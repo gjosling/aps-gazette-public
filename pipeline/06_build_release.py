@@ -27,7 +27,7 @@ import release_io
 
 SRC = 'data/gazette_vacancies_crosswalk.parquet'
 
-# ── Affirmative-measures linkage (spec 04) ────────────────────────────────────
+# ── Affirmative-measures linkage ──────────────────────────────────────────────
 #
 # APS agencies gazette the same role 2–3 times under Affirmative Measures
 # variants (Disability / Aboriginal and Torres Strait Islander) with distinct
@@ -42,7 +42,7 @@ SRC = 'data/gazette_vacancies_crosswalk.parquet'
 # The group key is (agency_canonical, AM-stripped normalised title,
 # classification_code as printed, closing_date). The classification component
 # trades rare over-merges for ~1% under-merges — under-merging is the accepted
-# direction. See docs/data_dictionary.md and specs/04-am-linkage.md.
+# direction. See docs/data_dictionary.md for the counting guidance.
 
 AM_TITLE_RE = re.compile(r'(?i)affirmative\s+measure')
 
@@ -137,13 +137,16 @@ def run():
         n_dt = df['duties_text'].notna().sum()
         print(f"duties_text: {n_dt:,} non-null ({n_dt / len(df) * 100:.1f}%)")
 
-    # Move agency_canonical and agency_group to immediately after branch
-    if all(c in df.columns for c in ('agency_canonical', 'agency_group', 'branch')):
-        cols = [c for c in df.columns if c not in ('agency_canonical', 'agency_group')]
+    # Move agency_canonical, agency_group and ps_act_employer to immediately after
+    # branch (ps_act_employer sits immediately after agency_group).
+    _agency_block = [c for c in ('agency_canonical', 'agency_group', 'ps_act_employer')
+                     if c in df.columns]
+    if 'branch' in df.columns and _agency_block:
+        cols = [c for c in df.columns if c not in _agency_block]
         branch_idx = cols.index('branch')
-        cols = cols[:branch_idx + 1] + ['agency_canonical', 'agency_group'] + cols[branch_idx + 1:]
+        cols = cols[:branch_idx + 1] + _agency_block + cols[branch_idx + 1:]
         df = df[cols]
-        print("agency_canonical/agency_group: moved to after branch")
+        print(f"{'/'.join(_agency_block)}: moved to after branch")
 
     # ── Column renames ────────────────────────────────────────────────────────────
 

@@ -95,9 +95,9 @@ PORTFOLIO_FALLBACK = {
     'Climate Change, Energy, the Environment and Water':
         'Department of Climate Change, Energy, the Environment and Water',
     'Infrastructure, Transport, Regional Development, Communications and the Arts':
-        'Department of Infrastructure, Transport, Regional Development, Communications and the Arts',
+        'Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts',
     'Infrastructure, Transport, Regional Development and Communications':
-        'Department of Infrastructure, Transport, Regional Development, Communications and the Arts',
+        'Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts',
     'Services Australia (part of the Social Services Portfolio)': 'Services Australia',
     'Services Australia (part of the Social':                     'Services Australia',
 }
@@ -281,25 +281,126 @@ def run():
     # ── Canonical remap: collapse stale pre-MoG names to current canonical ────────
     #
     # Prefix-matching inside match_canonical() resolves "Department of Industry,
-    # Science, Energy and Resources <division>" strings to DISER, and DITRDC
-    # variants to DITRDC — because those names remain in CANONICAL_AGENCIES for
-    # correct sub-entity prefix stripping.  A post-resolution remap here
-    # consolidates them to the current (post-Jul 2022) canonical without
-    # disrupting the resolution logic.
+    # Science, Energy and Resources <division>" strings to DISER, and older
+    # Infrastructure names to their own canonical — because those names remain in
+    # CANONICAL_AGENCIES for correct sub-entity prefix stripping.  A
+    # post-resolution remap here consolidates them to the current canonical
+    # without disrupting the resolution logic. Belt-and-braces with
+    # CANONICAL_FORWARD_MAP in 04 (manual/portfolio matches bypass that map, so
+    # this apply-time remap is the safety net that catches them).
     CANONICAL_REMAP = {
         'Department of Industry, Science, Energy and Resources':
             'Department of Industry, Science and Resources',
         'Department of Infrastructure, Transport, Regional Development and Communications':
-            'Department of Infrastructure, Transport, Regional Development, Communications and the Arts',
+            'Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts',
+        'Department of Infrastructure, Transport, Regional Development, Communications and the Arts':
+            'Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts',
     }
     remapped = df['agency_canonical'].replace(CANONICAL_REMAP)
     n_remapped = (df['agency_canonical'] != remapped).sum()
     if n_remapped:
-        print(f"Canonical remap: {n_remapped:,} rows updated (DISER→DISR / DITRDC→DITRDCA)")
+        print(f"Canonical remap: {n_remapped:,} rows updated (DISER→DISR / DITRDC→DITRDCSA / DITRDCA→DITRDCSA)")
     df['agency_canonical'] = remapped
     df['agency_group'] = df['agency_canonical'].map(
         lambda c: bac.get_agency_group(c) if pd.notna(c) else None
     )
+
+    # ── Row-level reattribution: single-vacancy misattributions ───────────────────
+    #
+    # Two rows are misattributed under the documented conventions and cannot be
+    # fixed via MANUAL_OVERRIDES (their raw agency strings are the generic keys
+    # for thousands of correctly-attributed rows). They are corrected here by
+    # vacancy_no:
+    #   VN-0704814 — raw agency APSC, division "Parliamentary Workplace Support
+    #     Service"; names PWSS in division rather than branch, so no pass reaches
+    #     it. Belongs to PWSS under the documented sub-entity exception.
+    #   VN-0700097 — raw agency printed as TGA in the source PDF, division
+    #     "Independent Hospital Pricing Authority"; a gazette-source error (fields
+    #     parse cleanly). The role is IHPA's.
+    # Correcting these removes the two mismatched pairs from the division-mismatch
+    # scan, which is why the corresponding ALLOWED_DIVISION_MISMATCH entries were
+    # deleted. These change agency_canonical/agency_group only, not vacancy
+    # identity.
+    VACANCY_NO_OVERRIDES = {
+        "VN-0704814": "Parliamentary Workplace Support Service",
+        "VN-0700097": "Independent Hospital Pricing Authority",
+    }
+    for vn, canon in VACANCY_NO_OVERRIDES.items():
+        mask = df['vacancy_no'] == vn
+        n = int(mask.sum())
+        if n:
+            df.loc[mask, 'agency_canonical'] = canon
+            df.loc[mask, 'agency_group']     = bac.get_agency_group(canon)
+            print(f"Row override: {vn} → {canon} ({n} row(s))")
+
+    # ── Antarctic + Environment-and-Energy pre-MoG date remap ─────────────────────
+    #
+    # MANUAL_OVERRIDES statically maps the Australian Antarctic Division strings
+    # (and the legacy "Department of the Environment and Energy" string) to DCCEEW
+    # regardless of date. But environment/climate functions lived in DAWE before
+    # the 2022-07 split; DCCEEW should be from-zero at 2022-07, with no spurious
+    # pre-2022 trickle. So for gazette_date < MOG_DATE we remap these rows to
+    # DAWE / "Agriculture department". Post-2022-07 rows keep DCCEEW (the static
+    # override is correct for them). This is the single date-aware point, matching
+    # the pre-MoG DAWE fallback pattern in resolve_div_required_row() above; the
+    # MANUAL_OVERRIDES entries themselves are left unchanged.
+    #
+    # Keying: the Antarctic rows key on the raw `agency` string (the three
+    # MANUAL_OVERRIDES keys). The DEE rows do NOT — in the surviving (deduped)
+    # printings the raw agency is "Environment and Energy" and the string
+    # "Department of the Environment and Energy" sits in `division`, so those rows
+    # are matched on the division string as well. (The remap keys on both columns
+    # for that reason.)
+    #
+    # The `== DCCEEW` guard on the DEE branch is essential and deliberate: one
+    # DEE-division row (VN-0672901) legitimately resolves to Clean Energy Regulator
+    # — a distinct agency whose division text merely starts with the DEE string —
+    # and must NOT be dragged into DAWE. The guard also keeps the remap targeted at
+    # the exact strings this fix concerns rather than "every pre-2022 DCCEEW row",
+    # so the downstream validation guard (zero pre-2022 DCCEEW) stays a real
+    # regression check, not a tautology that this remap could trivially satisfy.
+    DCCEEW_NAME = 'Department of Climate Change, Energy, the Environment and Water'
+    DAWE_NAME   = 'Department of Agriculture, Water and the Environment'
+    ANTARCTIC_RAW = {
+        'Australian Antarctic',
+        'Australian Antarctic Division',
+        'Australian Antarctic Division Australian Antarctic Division Various Various',
+    }
+    DEE_RAW = 'Department of the Environment and Energy'
+
+    def _strip(s):
+        return str(s).strip() if pd.notna(s) else ''
+
+    agency_key = df['agency'].map(_strip)
+    div_key    = df['division'].map(_strip)
+    pre_mog    = df['gazette_date'] < MOG_DATE
+    is_antarctic = agency_key.isin(ANTARCTIC_RAW)
+    is_dee = ((agency_key == DEE_RAW) | (div_key == DEE_RAW)) & (df['agency_canonical'] == DCCEEW_NAME)
+    remap_mask = pre_mog & (is_antarctic | is_dee)
+
+    n_remap = int(remap_mask.sum())
+    if n_remap:
+        df.loc[remap_mask, 'agency_canonical'] = DAWE_NAME
+        df.loc[remap_mask, 'agency_group']     = bac.get_agency_group(DAWE_NAME)
+        print(f"Antarctic/DEE pre-MoG remap: {n_remap:,} rows → "
+              f"DAWE / Agriculture department "
+              f"({int((pre_mog & is_antarctic).sum()):,} Antarctic + "
+              f"{int((pre_mog & is_dee).sum()):,} Environment-and-Energy)")
+
+    # ── ps_act_employer flag ──────────────────────────────────────────────────────
+    #
+    # True where the employing entity engages staff under the Public Service Act
+    # 1999; False for own-Act employers, Commonwealth companies and Parliamentary
+    # Service Act departments (bac.NON_PS_ACT_EMPLOYERS). Nullable boolean: null
+    # only where agency_canonical is null. Derived last, so it reflects every
+    # canonical/group correction above.
+    df['ps_act_employer'] = df['agency_canonical'].map(
+        lambda c: None if pd.isna(c) else c not in bac.NON_PS_ACT_EMPLOYERS
+    ).astype('boolean')
+    n_false = int((df['ps_act_employer'] == False).sum())
+    n_null_flag = int(df['ps_act_employer'].isna().sum())
+    print(f"ps_act_employer: {n_false:,} False (non-PS-Act), "
+          f"{n_null_flag:,} null (agency_canonical null)")
 
     # ── Coverage report ──────────────────────────────────────────────────────────
 

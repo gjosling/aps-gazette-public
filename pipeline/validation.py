@@ -48,6 +48,7 @@ _PIPELINE_DIR   = Path(__file__).resolve().parent
 _REPO_ROOT      = _PIPELINE_DIR.parent
 
 EXPECTATIONS    = _REPO_ROOT / "data" / "expectations.json"
+LINEAGE_CSV     = _REPO_ROOT / "data" / "agency_lineage.csv"
 RELEASE_PARQUET = _REPO_ROOT / "data" / "release" / "aps_gazette_vacancies.parquet"
 RAW_PARQUET     = _REPO_ROOT / "data" / "gazette_vacancies_raw.parquet"
 PARSE_LOG       = _REPO_ROOT / "data" / "parse_log.csv"
@@ -62,13 +63,19 @@ _spec = importlib.util.spec_from_file_location(
 bac = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bac)
 
-# Prefix pool for check 2: every canonical agency name, MINUS the two stale
-# pre-MoG names collapsed by CANONICAL_REMAP in 05_apply_crosswalk.py:289-294.
-# Those two (DISER, DITRDC) legitimately appear in pre-2022 division strings on
-# correctly-remapped rows (532 such rows) and must not flag.
+# Prefix pool for check 2: every canonical agency name, MINUS the collapsed
+# names that forward-map/remap to their current-name canonical in
+# 04_build_crosswalk.py (CANONICAL_FORWARD_MAP) and 05_apply_crosswalk.py
+# (CANONICAL_REMAP). These older names legitimately appear in division strings
+# on correctly-collapsed rows and must not flag as mismatches. Keep this set in
+# sync with those two maps.
+#   - DISER  → DISR
+#   - DITRDC → DITRDCSA   (via DITRDCA)
+#   - DITRDCA → DITRDCSA  (Infrastructure renamed to add Sport, 2025-05-13)
 _STALE_PREMOG_NAMES = {
     "Department of Industry, Science, Energy and Resources",
     "Department of Infrastructure, Transport, Regional Development and Communications",
+    "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
 }
 _DIVISION_PREFIX_POOL = sorted(
     (c for c in bac.CANONICAL_AGENCIES if c not in _STALE_PREMOG_NAMES),
@@ -285,16 +292,71 @@ def check_division_mismatch(df, exp) -> list:       # 2
     return [Finding(FAIL, f"division-mismatch: {len(offending)} pair(s), {total} row(s)", detail)]
 
 
-def check_am_groups(df, exp) -> list:               # 5 (activates after spec 04)
-    """AM-group count bounds. Dormant while expectations.am_linkage is null.
-    When non-null: FAIL if the spec-04 columns are missing (spec ordering
-    violated); otherwise WARN if counts fall outside the configured bounds.
+def check_lineage(df, exp) -> list:                 # 7
+    """MoG lineage table referential integrity.
 
-    AM-flag predicate (spec 04, finalised): a row is AM-flagged iff
-    is_affirmative_measure is True — i.e. job_title matches (?i)affirmative
-    measure. min_am_rows bounds that count. This replaces the spec-01 placeholder
-    that read a non-null posting_group_id as the AM flag (posting_group_id counts
-    linked rows — AM variants *and* their base postings — not AM-flagged rows).
+    data/agency_lineage.csv must parse; every predecessor_canonical and
+    successor_canonical must be a canonical agency name; relation values must be
+    a subset of {rename, merge, split}; effective_date must parse as ISO dates.
+    """
+    if not LINEAGE_CSV.exists():
+        return [Finding(FAIL, "lineage table", f"{LINEAGE_CSV.name} not found")]
+    try:
+        lin = pd.read_csv(LINEAGE_CSV)
+    except Exception as e:                           # pragma: no cover - defensive
+        return [Finding(FAIL, "lineage table parse", str(e))]
+    findings = []
+    required_cols = {"predecessor_canonical", "successor_canonical",
+                     "effective_date", "relation", "note"}
+    missing = required_cols - set(lin.columns)
+    if missing:
+        return [Finding(FAIL, "lineage columns", f"missing: {sorted(missing)}")]
+    canon = set(bac.CANONICAL_AGENCIES)
+    for col in ("predecessor_canonical", "successor_canonical"):
+        bad = sorted(set(lin[col].dropna()) - canon)
+        if bad:
+            findings.append(Finding(FAIL, f"lineage {col} not canonical", f"{bad}"))
+    bad_rel = sorted(set(lin["relation"].dropna()) - {"rename", "merge", "split"})
+    if bad_rel:
+        findings.append(Finding(FAIL, "lineage relation values", f"unexpected: {bad_rel}"))
+    parsed = pd.to_datetime(lin["effective_date"], format="%Y-%m-%d", errors="coerce")
+    n_bad = int(parsed.isna().sum())
+    if n_bad:
+        findings.append(Finding(FAIL, "lineage effective_date parse",
+                                f"{n_bad} value(s) not ISO YYYY-MM-DD"))
+    return findings
+
+
+def check_premog_dcceew(df, exp) -> list:           # 8
+    """Antarctic/DEE regression guard: zero release rows attributed to DCCEEW
+    with a pre-2022-07 gazette date.
+
+    Environment/climate functions lived in DAWE before the July 2022 split, so
+    DCCEEW must be from-zero at 2022-07 — no spurious pre-2022 trickle. The
+    05_apply_crosswalk.py date remap enforces this; this check guards against a
+    regression that would reintroduce the trickle.
+    """
+    DCCEEW = "Department of Climate Change, Energy, the Environment and Water"
+    gd = pd.to_datetime(df["gazette_date"])
+    n = int(((df["agency_canonical"] == DCCEEW) & (gd < pd.Timestamp("2022-07-01"))).sum())
+    if n == 0:
+        return []
+    return [Finding(FAIL, "pre-2022-07 DCCEEW rows",
+                    f"got {n}, expected 0 (pre-split environment functions belong to DAWE)")]
+
+
+def check_am_groups(df, exp) -> list:               # 5 (activates after affirmative-measures linkage lands)
+    """AM-group count bounds. Dormant while expectations.am_linkage is null.
+    When non-null: FAIL if the affirmative-measures linkage columns are missing
+    (build ordering violated — the linkage step in 06_build_release.py must run
+    before this check has anything to bound); otherwise WARN if counts fall
+    outside the configured bounds.
+
+    AM-flag predicate: a row is AM-flagged iff is_affirmative_measure is True —
+    i.e. job_title matches (?i)affirmative measure. min_am_rows bounds that count.
+    (This deliberately counts AM-flagged rows, not non-null posting_group_id:
+    posting_group_id counts linked rows — AM variants *and* their base postings —
+    not AM-flagged rows.)
     """
     am = exp.get("am_linkage")
     if am is None:
@@ -303,7 +365,7 @@ def check_am_groups(df, exp) -> list:               # 5 (activates after spec 04
     if missing:
         return [Finding(FAIL, "am_linkage",
                         f"expectations.am_linkage is set but column(s) {missing} missing "
-                        f"(spec 04 ordering violated)")]
+                        f"(affirmative-measures linkage step did not run — build ordering violated)")]
     findings = []
     grp = df["posting_group_id"]
     am_rows = int(df["is_affirmative_measure"].sum())
@@ -338,7 +400,8 @@ def check_boilerplate_residual(df, exp) -> list:    # 6
     hits = int(pop["description_clean"].str.contains(phrase, case=False, regex=False).sum())
     pct = hits / len(pop) * 100
     # Handshake kept in data: FAIL when the ceiling is tightened below 1.0
-    # (spec 05), WARN otherwise.
+    # (the v2 corpus-wide boilerplate pass drove residual to ~0, so a sub-1.0
+    # ceiling is a deliberate regression gate), WARN otherwise.
     severity = FAIL if ceiling < 1.0 else WARN
     if pct <= ceiling:
         return []
@@ -366,6 +429,8 @@ def validate_release(df, expectations) -> list:
     _report("field-bleed pattern", check_field_bleed(df, expectations), findings)
     _report("empty strings", check_empty_strings(df, expectations), findings)
     _report("division-mismatch guard", check_division_mismatch(df, expectations), findings)
+    _report("lineage table integrity", check_lineage(df, expectations), findings)
+    _report("pre-2022-07 DCCEEW guard", check_premog_dcceew(df, expectations), findings)
     _report("AM-group bounds", check_am_groups(df, expectations), findings)
     # check 6 prints its own SKIP line when description_clean is absent
     bp = check_boilerplate_residual(df, expectations)

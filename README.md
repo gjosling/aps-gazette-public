@@ -27,10 +27,10 @@ Scripts are numbered in execution order:
 
 | Script | What it does |
 |--------|-------------|
-| `01_download.py` | Probe the APSC S3 bucket for gazette PDFs and download them locally |
+| `01_download.py` | Probe the APSC S3 bucket for gazette PDFs and download them locally; recently not-found dates are re-probed for 28 days before becoming a permanent skip |
 | `02_parse.py` | Extract structured vacancy notices from each PDF using pdftotext; outcome notice PDFs are skipped. Parse state (`data/parse_log.csv`) and the raw parquet are flushed together in batches; failed or missing PDFs are retried on the next run |
 | `03_normalise.py` | Derive salary_min/max, closing_date, duties_text, location_normalised, classification_clean |
-| `04_build_crosswalk.py` | Define agency name normalisations (MoG changes, renames, merges) |
+| `04_build_crosswalk.py` | Define agency name normalisations (MoG changes, renames, merges); emit `agency_lineage.csv` |
 | `05_apply_crosswalk.py` | Apply the crosswalk with date-aware resolution |
 | `06_build_release.py` | Deduplicate (drop daily rows where a weekly version exists), run release validation (`pipeline/validation.py`, with bounds in the committed `data/expectations.json`) that **fails the build and blocks publication** on any failing check, rename columns, convert gazette_date to date, derive `is_affirmative_measure` and `posting_group_id`, write the release parquet |
 | `07_clean_text.py` | Detect and strip boilerplate from `description`, producing `description_clean` — a per-agency frequency pass plus a global corpus-wide pass that removes gazette-wide template text (RecruitAbility, the May-2025 eligibility passage) even from small agencies; redact email addresses, phone numbers, and contact officer names from description fields; write the boilerplate audit trail as both `data/diagnostics/boilerplate_sentences.csv` (stable name) and a dated archive `data/diagnostics/boilerplate_sentences-<version>-<date>.csv` (kept locally; regenerable by re-running 07) |
@@ -151,7 +151,7 @@ Most APS agencies will match cleanly on `agency_canonical`. Unmatched rows are e
 
 ### Caveats
 
-**Agencies outside PS Act scope (~15% of gazette rows).** AFP, CASA, ASIC, courts, and parliamentary departments advertise vacancies in the gazette but are not included in APSED. These rows will be left-join nulls.
+**Agencies outside PS Act scope (roughly one in ten gazette rows — 10.6% — flagged by the `ps_act_employer` column).** AFP, CASA, ASIC, parliamentary departments and Commonwealth companies engage staff outside the *Public Service Act 1999*. These — along with the courts and tribunals (whose registry staff APSED also excludes) — advertise vacancies in the gazette but are not included in APSED, so they will be left-join nulls.
 
 **Reliable agency join window: Jun 2024 onwards.** The APSED agency × job family table begins in June 2024. Gazette data goes back to January 2020, but there is no APSED counterpart before June 2024.
 
@@ -200,6 +200,8 @@ After verifying the output, push updated state files to R2 with `r2_sync.py push
 Three types of machinery-of-government change create discontinuities that affect longitudinal analysis. These reflect real structural changes to the APS, but they require care when comparing agency-level data across time.
 
 **Agency splits and merges.** `agency_canonical` reflects the name at the time of publication. Pre-split vacancies appear under the predecessor, post-split vacancies under the relevant successor. `agency_group` provides a stable label that groups an agency with its primary functional successor across renames and partial splits (e.g. DAWE and DAFF both map to `"Agriculture department"`), but it does not fully resolve genuine functional splits. The two major splits in this dataset's time range are the July 2022 MoG changes: DAWE → DAFF + DCCEEW, and DESE → Department of Education + DEWR. For both, there is no clean solution. Pre-split DESE vacancies covered both education and employment functions, and there is no principled way to attribute them to one successor at the agency level. Rather than group DESE with both successors, DESE and Department of Education share a group; DEWR has its own. The same applies to the DAWE split: DAWE and DAFF share a group; DCCEEW does not.
+
+A machine-readable lineage table (`agency_lineage.csv`, published beside the release) encodes these changes — factual predecessor/successor events only, no split weights; see the data dictionary for why — generated from the `MOG_CHANGES` table in `pipeline/04_build_crosswalk.py`.
 
 **Function transfers.** Branches or divisions can transfer between agencies without either agency being renamed. These transfers are invisible in the data. Both agencies continue to exist, but their functional scope changes. A sudden shift in an agency's job family composition may reflect a function moving in or out rather than a genuine change in hiring priorities.
 

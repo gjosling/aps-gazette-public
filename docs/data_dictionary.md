@@ -69,8 +69,34 @@ published versions were not archived and are not recoverable.
 | `branch` | string | Raw branch name from the PDF. Used as secondary resolution input for `DIVISION_REQUIRED` rows. |
 | `agency_canonical` | string | Canonical agency name as of the gazette date, after applying the crosswalk and date-aware MoG resolution. When the gazette PDF printed only a portfolio name (e.g. `"Social Services"`, `"Treasury"`, `"Prime Minister and Cabinet"`) and the division field identifies a specific sub-entity (e.g. `"National Disability Insurance Agency"`), the sub-entity is used. Null where the agency cannot be resolved (see Known Limitations). |
 | `agency_group` | string | Stable grouping label for longitudinal analysis across MoG changes. Renames and clear-successor cases share a group; genuine functional splits get separate groups. See Notes below. |
+| `ps_act_employer` | boolean | True where the employing entity engages staff under the *Public Service Act 1999*, False for own-Act employers, Commonwealth companies and Parliamentary Service Act departments (list maintained in `pipeline/04_build_crosswalk.py::NON_PS_ACT_EMPLOYERS`); null only where `agency_canonical` is null. See the classification-nulls limitation for why this matters when analysing APS classification levels. |
 
-**`agency_group` grouping logic:** For renames and cases with a clear functional successor, predecessor and successor share a group (e.g. DAWE and DAFF both map to `"Agriculture department"`). For genuine functional splits, the split-off entity gets its own group. The two major splits in this dataset: DAWE→DAFF+DCCEEW (DAWE and DAFF share a group; DCCEEW does not) and DESE→Education+DEWR (DESE and Department of Education share a group; DEWR does not). These are not fully bridged by `agency_group`.
+**`agency_group` grouping logic:** For renames and cases with a clear functional successor, predecessor and successor share a group (e.g. DAWE and DAFF both map to `"Agriculture department"`). For genuine functional splits, the split-off entity gets its own group. The two major splits in this dataset: DAWE→DAFF+DCCEEW (DAWE and DAFF share a group; DCCEEW does not) and DESE→Education+DEWR (DESE and Department of Education share a group; DEWR does not). These are not fully bridged by `agency_group`. Pre-2022-07 Australian Antarctic Division rows (and the pre-split Department of the Environment and Energy rows) are attributed to DAWE (`"Agriculture department"`), not DCCEEW: environment/climate functions lived in DAWE before the July 2022 split, so DCCEEW starts from zero at 2022-07.
+
+### MoG lineage table
+
+A machine-readable predecessor/successor event table is published alongside the release at `https://data.foiforest.org/gazette/agency_lineage.csv` (committed as `data/agency_lineage.csv`, generated from the `MOG_CHANGES` table in `pipeline/04_build_crosswalk.py`). It records **factual events only** — one row per (predecessor, successor) pair:
+
+| Column | Description |
+|--------|-------------|
+| `predecessor_canonical` | Entity name before the change (a canonical agency name). |
+| `successor_canonical` | Entity name after the change (a canonical agency name). |
+| `effective_date` | Statutory effective date (see note below). |
+| `relation` | `rename` (1→1), `merge` (N→1 or absorbed-into), or `split` (1→N; one row per successor). |
+| `note` | Short description of the change. |
+
+**Why the table carries no split weights.** Gazette vacancy flows track *functions and stand-up timing*, not headcount shares. When DAWE split into DAFF and DCCEEW, the split of *advertised vacancies* depends on which functions were hiring in a given period and on the new department's stand-up recruitment surge — neither of which a static headcount share captures. Any single weight pair would be defensible for one analytical question and wrong for another, so no general-purpose weights exist to publish. Users bridging a series across a split boundary must make their own apportionment call — and the right call is often "don't bridge; annotate the break". The table tells you *where* the breaks are and *what* happened; it deliberately does not tell you how to allocate.
+
+**`effective_date` is statutory, not first-appearance.** The dates are Administrative Arrangements Order / commencement dates, not the first date the new name appears in this dataset. Gazette usage lags renames by weeks — e.g. IHPA-named rows keep appearing until 2022-08-25, after the 2022-08-12 IHACPA rename. So date heuristics derived from the row data run late (do not use them to "correct" a statutory date), and users joining `agency_lineage.csv` to the data should expect old names to persist briefly past each `effective_date`.
+
+**Lineage events vs. how a chain is represented — two modes.** The lineage table records machinery-of-government *events*; how the dataset *represents* each chain in `agency_canonical` is a separate, per-chain choice. Two conventions are in use:
+
+- **Collapsed (Infrastructure).** The Department of Infrastructure chain — DITRDC ("…and Communications", 2020-02→2022-06) → DITRDCA ("…and the Arts", 2022-07→2025-05-12) → DITRDCSA ("…Communications, Sport and the Arts", 2025-05-13→) — is presented as **one continuous series under the current official name** ("…Communications, Sport and the Arts"). All rows across the three name eras carry that single `agency_canonical`; the two earlier names remain as zero-row canonical members. The `agency_lineage.csv` rows (DITRDC→DITRDCA and DITRDCA→DITRDCSA) are the machine-readable record of the two renames; consumers wanting era-level Infrastructure series can **segment on the lineage `effective_date` values** (`< 2022-07-01`, `2022-07-01 … 2025-05-12`, `≥ 2025-05-13`).
+- **Split (Health).** The Health chain — Department of Health → Department of Health and Aged Care → Department of Health, Disability and Ageing — is presented as **per-name canonicals**, one series per name, bridged by the corresponding lineage rows. Each name carries its own rows.
+
+Both are valid; the lineage table is what lets a consumer reconcile them. Use `agency_group` for a stable trend label across either kind of chain.
+
+**January-2020 rows and the February-2020 AAO.** The dataset opens 2020-01-16 — about two weeks before the Administrative Arrangements Order of 5 December 2019 took effect (2020-02-01). The ~533 rows gazetted in January 2020 appear under pre-AAO agency names (e.g. Department of Human Services, Department of Communications and the Arts, Department of Industry, Innovation and Science) and are attributed to their post-AAO successor canonicals (Services Australia, the Infrastructure department, the Industry department, etc.). These transitions are **not** in the lineage table, because the predecessors never appear as canonical agencies in the data — there is no from-side series to bridge.
 
 ### Agency attribution convention
 
@@ -140,7 +166,7 @@ The method is **versioned**; the current version is `2026-07-v2` and is recorded
 
 ### Job family classification
 
-Classified using `claude-sonnet-4-6` against the [APSC 2025 Job Family Framework](https://www.apsc.gov.au/working-aps/joining-aps/job-families) (16 families). Overall accuracy on a 200-ad hand-labelled validation sample: 88%. A majority of classifications carry `high` confidence (approximately 60%); a substantial minority carry `medium` confidence (approximately 39%), and a small number carry `low` confidence (approximately 1%). High-confidence classifications achieve ~98% accuracy on the validation sample. See Known Limitations for caveats on medium- and low-confidence rows.
+Classified using `claude-sonnet-4-6` against the [APSC 2025 Job Family Framework](https://www.apsc.gov.au/working-aps/joining-aps/job-families) (16 families). Overall accuracy on a 200-ad hand-labelled validation sample: 88%. The classification prompt is integrity-checked: its sha256 is registered against the prompt version in `prompts/versions.json` and stored per row (`job_family_prompt_sha256`) in the private classifications file, and the build refuses to run if the prompt file changes without a version bump. A majority of classifications carry `high` confidence (approximately 60%); a substantial minority carry `medium` confidence (approximately 39%), and a small number carry `low` confidence (approximately 1%). High-confidence classifications achieve ~98% accuracy on the validation sample. See Known Limitations for caveats on medium- and low-confidence rows.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -224,6 +250,8 @@ PS7,VN-0686379,BUSINESS_AND_ORGANISATIONAL_MANAGEMENT,medium,PORTFOLIO_PROGRAM_A
 
 When a new agency is created (typically after a machinery-of-government change) and its name has not yet been added to `data/agency_crosswalk.csv`, rows from that agency will have `agency_canonical = null` until the next crosswalk update. The crosswalk is maintained manually and updated when new agency names appear in the gazette.
 
+The 2020 Hearing Australia row (a Commonwealth company, previously null) is now mapped to a canonical agency. One known unresolvable row remains: a March 2020 notice printed with agency and division both `"Various"` (an "APS HR Graduate Program" ad naming no specific entity).
+
 ### Garbled parse (VN-0752313)
 
 The raw `agency` field for VN-0752313 (gazette_date 2024-12-12) contains the full job description concatenated into it due to a garbled parse from a non-standard notice layout in the source PDF. `agency_canonical` resolved indirectly to `National Disability Insurance Agency` because the garbled text begins with the `Social Services` portfolio string, triggering division-field resolution. The agency attribution is likely correct, but the `agency`, `division`, and `description` fields for this row are unreliable. Cannot be fully recovered from the parquet without re-parsing the source PDF.
@@ -234,7 +262,11 @@ Many rows have agency names printed as portfolio names in the gazette PDF (e.g. 
 
 ### classification nulls
 
-All rows where `classification` is null are correct nulls, not parse failures. Most arise from field-bleed artefacts (C3): in some notices, a value from an adjacent field bleeds into the classification field and is nulled by the parser guard. A small number were always null in the source PDF.
+`classification_code` is **~100% null for non-PS-Act employers** — their notices print no APS classification (e.g. ACECQA 252/252, ANSTO 203/203, NHVR ~98%, the Central/Northern Land Councils ~95–100%), and it is partially null for CSIRO (~48%), CASA (~31%) and AFP (~24%). This is systematic, not a parse failure: staff at these entities are not engaged under the *Public Service Act 1999*. **Filter with `ps_act_employer` when analysing APS classification levels** — restricting to `ps_act_employer = True` removes the bulk of the structural nulls.
+
+Additionally, ~646 rows carry **non-APS grade vocabularies as printed** (`Statutory Appointment` (327), Government Lawyer bands, `Meat Inspector`, `Antarctic Medical Practitioner`, …). These are kept in `classification_code` deliberately — faithfulness to the printed gazette is the default — so **do not assume the column's domain is `APS1`–`SES3`**.
+
+All remaining `classification` nulls are correct nulls, not parse failures. Most arise from field-bleed artefacts (C3): in some notices, a value from an adjacent field bleeds into the classification field and is nulled by the parser guard. A small number were always null in the source PDF.
 
 A small number of rows have both `classification` and `classification_code` null due to field-bleed values not caught by the C3 guard: reference-number strings such as `CS - 2044`, `23-RLSDIV-18270`, `OPS - 2220`, `NSW`. These are position numbers and location strings, not APS grade codes.
 
@@ -270,6 +302,8 @@ The parser extracts up to 3 levels of agency hierarchy (agency / division / bran
 ### Daily vs. weekly deduplication
 
 The APSC reposts weekly vacancy notices in daily gazettes. `06_build_release.py` resolves this: where the same `vacancy_no` appears in both a daily and a weekly gazette (`vacancy_only` or `combined`), the weekly row is kept and the daily row is dropped. Weekly PDFs produce better structural parsing, as division and branch are properly separated and position numbers are meaningful rather than placeholder strings. Where a `vacancy_no` appears only in daily gazettes (no weekly counterpart), the daily row is retained.
+
+Daily-only notices (456 rows as of July 2026) were spot-checked against subsequent weekly gazettes to confirm they are genuine daily-only publications, not weekly-parse misses: 5/5 sampled notices were absent from the following two weeklies (verified 2026-07-06).
 
 ### salary_min / salary_max nulls
 

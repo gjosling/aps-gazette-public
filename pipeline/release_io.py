@@ -38,7 +38,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-DATASET_VERSION = "1.3.0"   # see version policy above
+DATASET_VERSION = "1.5.0"   # see version policy above
 
 RELEASE_DIR  = Path("data/release")
 PARQUET_PATH = RELEASE_DIR / "aps_gazette_vacancies.parquet"

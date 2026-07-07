@@ -15,8 +15,13 @@ Handles:
   - Portfolio-name-only strings where the real entity is in 'division' (flagged "division_required")
 
 Usage:
-    python pipeline/04_build_crosswalk.py           # writes data/agency_crosswalk.csv
-    python pipeline/04_build_crosswalk.py --dry-run # print uncertain mappings only
+    python pipeline/04_build_crosswalk.py                # writes data/agency_crosswalk.csv
+                                                         #   (and data/agency_lineage.csv)
+    python pipeline/04_build_crosswalk.py --dry-run      # print uncertain mappings only
+    python pipeline/04_build_crosswalk.py --lineage-only # write data/agency_lineage.csv only
+
+Also emits data/agency_lineage.csv — the machine-readable MoG predecessor/
+successor event table — from the MOG_CHANGES dict (see emit_lineage_csv).
 
 Note: data/agency_crosswalk.csv is committed to the repo. Re-run this script only
 if you update the canonical list or matching rules below.
@@ -247,6 +252,8 @@ CANONICAL_AGENCIES = [
     "Export Finance Australia",
     "Indigenous Land and Sea Corporation",
     "Indigenous Business Australia",
+    "Hearing Australia",   # Commonwealth company (Australian Hearing Services Act 1991); in-scope
+
     "Australian Sports Anti-Doping Authority",      # pre-Jul 2020; renamed to Sport Integrity Australia
     "Sport Integrity Australia",
     "North Queensland Water Infrastructure Authority",
@@ -285,12 +292,16 @@ CANONICAL_FORWARD_MAP = {
     # MoG Jul 2022: DISER → DISR
     "Department of Industry, Science, Energy and Resources":
         "Department of Industry, Science and Resources",
-    # MoG Jul 2022: DITRDC → DITRDCA
+    # Infrastructure chain collapses to the current official name (DITRDCSA,
+    # "…Communications, Sport and the Arts", effective 2025-05-13). The two
+    # earlier names — DITRDC ("…and Communications", 2020-02→2022-06) and
+    # DITRDCA ("…and the Arts", 2022-07→2025-05-12) — stay in CANONICAL_AGENCIES
+    # as zero-row members and forward-map to the current name so the series is
+    # continuous. See the DITRDC→DITRDCA→DITRDCSA lineage rows.
     "Department of Infrastructure, Transport, Regional Development and Communications":
-        "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
-    # 2024 Sport variant → standard DITRDCA name
-    "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts":
-        "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
+        "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
+    "Department of Infrastructure, Transport, Regional Development, Communications and the Arts":
+        "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
     # Long-form NDIS QSC → short canonical form used consistently in the data
     "National Disability Insurance Scheme Quality and Safeguards Commission":
         "NDIS Quality and Safeguards Commission",
@@ -359,10 +370,10 @@ PORTFOLIO_ONLY_MAP = {
     "Home Affairs":                                                "Department of Home Affairs",
     "Environment and Energy":                                      "Clean Energy Regulator",
     "Infrastructure, Transport, Regional Development, Communications and the Arts":
-                                                                   "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
+                                                                   "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
     "Infrastructure, Transport, Regional Development and Communications":
-                                                                   "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
-    "Infrastructure":                                              "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
+                                                                   "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
+    "Infrastructure":                                              "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
     "Treasury":                                                    "Department of the Treasury",
     "Finance":                                                     "Department of Finance",
     "Defence":                                                     "Department of Defence",
@@ -412,19 +423,21 @@ MANUAL_OVERRIDES = {
     "Department of the Environment and Energy":
         "Department of Climate Change, Energy, the Environment and Water",
 
-    # Infrastructure portfolio 2020: "Cities" variant before Feb 2020 rename to DITRDC
+    # Infrastructure portfolio 2020: "Cities" variant before Feb 2020 rename to DITRDC.
+    # Target is the current official name (DITRDCSA); manual matches bypass the
+    # forward map, so these must name the final canonical directly.
     "Department of Infrastructure, Transport, Cities and Regional Development":
-        "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
+        "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
     "Department of Communications and the Arts":
-        "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
+        "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
     "Communications Infrastructure":
-        "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
+        "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
     "Infrastructure, Transport, Cities and":
-        "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
+        "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
     "Infrastructure, Transport, Cities and Regional Development Department of Infrastructure, Transport, Regional Development and Communications":
-        "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
+        "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
     "Infrastructure, Transport, Cities and Regional Development Department of Infrastructure, Transport, Cities and Regional Development":
-        "Department of Infrastructure, Transport, Regional Development, Communications and the Arts",
+        "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts",
 
     # ── Truncated strings that won't prefix-match ────────────────────────────
     "National Offshore Petroleum Safety and":
@@ -552,9 +565,24 @@ MANUAL_OVERRIDES = {
 # Key splits/renames 2021-2026. Used to:
 #  1. Validate that pre/post-split names don't bleed across the boundary
 #  2. Determine agency_group for renamed entities
+#  3. Emit data/agency_lineage.csv (emit_lineage_csv, below): the published,
+#     machine-readable predecessor/successor event table. This dict is the
+#     single source of truth for that table.
+#
+# effective_date values are STATUTORY dates (Administrative Arrangements Order
+# / commencement dates), NOT first-appearance dates in this dataset. Gazette
+# usage lags renames by weeks — e.g. IHPA-named rows keep appearing until
+# 2022-08-25, after the 2022-08-12 IHACPA rename. Two consequences: (i) date
+# heuristics derived from row data run late and must not be used to "correct"
+# these statutory dates; (ii) users joining agency_lineage.csv to the data
+# should expect old names to persist briefly past each effective_date.
 # ============================================================
 
-# Format: {raw_name_or_signal: (effective_date, successor_or_note)}
+# Format: {change_key: {"effective": ISO date, "predecessors": [...],
+#          "successors": [...], "note": str, ["relation": str]}}
+# relation is derived when absent (split if >1 successor, else rename); an
+# explicit "relation" key wins (used for merges, which successor-count can't
+# distinguish from a rename).
 MOG_CHANGES = {
     # Jul 2022 election transition (official date: 1 Jul 2022 for most)
     "DAWE_split": {
@@ -568,7 +596,7 @@ MOG_CHANGES = {
         "effective": "2022-07-01",
         "predecessors": ["Department of Industry, Science, Energy and Resources"],
         "successors":   ["Department of Industry, Science and Resources"],
-        "note": "Energy and resources functions moved to DCCEEW; DISER became DISR",
+        "note": "Energy functions moved to DCCEEW; DISER became DISR",
     },
     "DESE_split": {
         "effective": "2022-07-01",
@@ -581,13 +609,19 @@ MOG_CHANGES = {
         "effective": "2022-07-01",
         "predecessors": ["Department of Infrastructure, Transport, Regional Development and Communications"],
         "successors":   ["Department of Infrastructure, Transport, Regional Development, Communications and the Arts"],
-        "note": "Arts added to Infrastructure portfolio following communications/arts merger",
+        "note": "Renamed to reflect arts functions (in the portfolio since the 2020 Communications and the Arts merger)",
+    },
+    "DITRDCA_to_DITRDCSA": {
+        "effective": "2025-05-13",
+        "predecessors": ["Department of Infrastructure, Transport, Regional Development, Communications and the Arts"],
+        "successors":   ["Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts"],
+        "note": "Sport and recreation functions transferred from the Health portfolio; department renamed. This dataset presents the DITRDC → DITRDCA → DITRDCSA chain as one continuous series under the current name — see the data dictionary.",
     },
     "Health_rename": {
         "effective": "2022-07-01",
         "predecessors": ["Department of Health"],
         "successors":   ["Department of Health and Aged Care"],
-        "note": "Aged care functions formally incorporated into Health portfolio",
+        "note": "Renamed to reflect aged-care functions; no function transfer",
     },
     # 2020 sports integrity reform
     "ASADA_to_SIA": {
@@ -601,6 +635,9 @@ MOG_CHANGES = {
         "effective": "2023-07-01",
         "predecessors": ["Australian Commission for Law Enforcement Integrity"],
         "successors":   ["National Anti-Corruption Commission"],
+        "relation":     "merge",   # ACLEI was absorbed into the broader NACC; a
+                                   # single-successor derivation would mislabel this
+                                   # "rename". The note records the merge intent.
         "note": "ACLEI merged into new NACC (broader jurisdiction)",
     },
     # 2024 tribunal reform
@@ -610,12 +647,37 @@ MOG_CHANGES = {
         "successors":   ["Administrative Review Tribunal"],
         "note": "AAT abolished and replaced by Administrative Review Tribunal",
     },
-    # Health late-2024 disability rename (tentative; confirm with gazette dates)
+    # Health disability rename — effective with the Administrative Arrangements
+    # Order made 13 May 2025 (ANAO portfolio page and the PM&C AAO page concur).
+    # Gazette usage confirms the direction: last "Department of Health and Aged
+    # Care" row gazetted 2025-05-29, first "Department of Health, Disability and
+    # Ageing" row 2025-06-05 — statutory date precedes usage, as expected.
     "Health_disability_rename": {
-        "effective": "2024-07-01",
+        "effective": "2025-05-13",
         "predecessors": ["Department of Health and Aged Care"],
         "successors":   ["Department of Health, Disability and Ageing"],
-        "note": "Disability functions re-integrated following NDIS review; rename tentative",
+        "note": "NDIS and Foundational Supports functions transferred from Social Services (broader disability policy followed 2025-06-26 via AAO amendment); department renamed",
+    },
+    # IHPA → IHACPA rename. National Health Reform Act 2011 amendments commenced
+    # 12 August 2022 (source: IHACPA's own FAQ). The gazette kept printing the
+    # old name until 2022-08-25 (56 IHPA rows, last gazetted 2022-08-25;
+    # 91 IHACPA rows, first gazetted 2022-10-06) — statutory date, not usage.
+    "IHPA_to_IHACPA": {
+        "effective": "2022-08-12",
+        "predecessors": ["Independent Hospital Pricing Authority"],
+        "successors":   ["Independent Health and Aged Care Pricing Authority"],
+        "note": "IHPA renamed and expanded to IHACPA (aged-care pricing functions added)",
+    },
+    # ASEA → ASSEA rename. Commencement per the Fair Work Legislation Amendment
+    # (Closing Loopholes) Act 2023, 15 December 2023 (sources: Finance PGPA
+    # newsletter 99 and the DEWR amendments document, both stating 15 Dec 2023).
+    # CAUTION: DEWR's overview page says 7 December 2023 — that is the amending
+    # Act's *passage*, not commencement; do NOT "correct" the date to it.
+    "ASEA_to_ASSEA": {
+        "effective": "2023-12-15",
+        "predecessors": ["Asbestos Safety and Eradication Agency"],
+        "successors":   ["Asbestos and Silica Safety and Eradication Agency"],
+        "note": "Silica functions added; agency renamed to include silica safety",
     },
 }
 
@@ -651,9 +713,10 @@ AGENCY_GROUP = {
     # Employment MoG split
     "Department of Employment and Workplace Relations":         "Employment department",
 
-    # Infrastructure MoG rename
+    # Infrastructure MoG rename (all three name eras group together)
     "Department of Infrastructure, Transport, Regional Development and Communications":  "Infrastructure department",
     "Department of Infrastructure, Transport, Regional Development, Communications and the Arts": "Infrastructure department",
+    "Department of Infrastructure, Transport, Regional Development, Communications, Sport and the Arts": "Infrastructure department",
 
     # Health MoG rename
     "Department of Health":                                     "Health department",
@@ -674,12 +737,60 @@ AGENCY_GROUP = {
 
 
 # ============================================================
+# SECTION 5a — NON-PUBLIC-SERVICE-ACT EMPLOYERS
+#
+# Canonical agencies whose staff are NOT engaged under the Public Service Act 1999
+# (own-Act employers, Commonwealth companies, Parliamentary Service Act departments).
+# ps_act_employer = canonical not in this set (05_apply_crosswalk.py derives the
+# release column). Maintained manually; verify additions against the entity's
+# enabling legislation or the APSC "APS agencies" list — membership is decided by
+# legislation, NOT by the empirical classification_code null rate (borderline
+# empirics like CASA and AFP still print APS-comparable bands on some notices but
+# remain own-Act). Each entry is annotated with the enabling statute that is the
+# claim to check; drop or add entries only with a citation.
+# ============================================================
+
+NON_PS_ACT_EMPLOYERS = {
+    # Parliamentary Service Act 1999
+    "Department of Parliamentary Services",
+    "Department of the House of Representatives",
+    "Department of the Senate",
+    "Parliamentary Budget Office",
+    # Own-Act / statutory employment powers
+    "Australian Federal Police",                                    # AFP Act 1979
+    "Commonwealth Scientific and Industrial Research Organisation",  # Science and Industry Research Act 1949
+    "Australian Nuclear Science and Technology Organisation",       # ANSTO Act 1987
+    "Civil Aviation Safety Authority",                             # Civil Aviation Act 1988
+    "Airservices Australia",                                       # Air Services Act 1995
+    "Australian Securities and Investments Commission",            # ASIC Act 2001 s120
+    "Australian Prudential Regulation Authority",                  # APRA Act 1998
+    "Australian Security Intelligence Organisation",              # ASIO Act 1979
+    "Australian Secret Intelligence Service",                     # Intelligence Services Act 2001
+    "Australian Signals Directorate",                             # own-Act employer since 1 Jul 2018 (Intelligence Services Act 2001)
+    "National Heavy Vehicle Regulator",                          # state co-operative body, HVNL
+    "Australian Children's Education and Care Quality Authority",  # national-law body
+    "Northern Land Council",                                      # Aboriginal Land Rights (NT) Act 1976
+    "Central Land Council",                                       # Aboriginal Land Rights (NT) Act 1976
+    "Aboriginal Hostels Limited",                                # Cth company
+    "Hearing Australia",                                          # Cth company (Australian Hearing Services Act 1991)
+    "Export Finance Australia",                                   # EFIC Act 1991
+    "Indigenous Business Australia",                             # ATSI Act 2005
+    "Indigenous Land and Sea Corporation",                       # ATSI Act 2005
+    "Northern Territory Aboriginal Investment Corporation",       # ATSI Act 2005 (from 2021)
+    "Australian Strategic Policy Institute",                      # Cth company
+    "High Court of Australia",                                    # High Court of Australia Act 1979
+    "Australian Institute of Marine Science",                    # AIMS Act 1972
+}
+
+
+# ============================================================
 # SECTION 5b — DIVISION-MISMATCH ALLOWLIST
 #
 # Used by pipeline/validation.py check 2 (the AIFS-class regression guard).
 # For each release row whose `division` string starts with a canonical agency
-# name (longest-prefix match against CANONICAL_AGENCIES, minus the two stale
-# pre-MoG names collapsed by CANONICAL_REMAP in 05_apply_crosswalk.py) that
+# name (longest-prefix match against CANONICAL_AGENCIES, minus the three
+# collapsed names — DISER, DITRDC, and DITRDCA — that forward-map/remap to their
+# current-name canonical) that
 # DIFFERS from the row's `agency_canonical`, the ordered pair
 # (agency_canonical, division_canonical) must appear here. Any unlisted pair
 # FAILs the build — this is what would have caught the AIFS misattribution.
@@ -687,8 +798,8 @@ AGENCY_GROUP = {
 # Seeded with exactly the 27 pairs (583 rows) observed in the 2026-07-06
 # release under the module prefix pool. Each entry is a deliberate
 # employing-entity/sub-entity convention, a prefix-matcher false positive, or a
-# TEMPORARY single-row misattribution flagged for spec 07. Do NOT add entries
-# without row-level evidence.
+# TEMPORARY single-row misattribution pending reattribution (see the per-entry
+# notes below). Do NOT add entries without row-level evidence.
 # ============================================================
 
 ALLOWED_DIVISION_MISMATCH = {
@@ -743,25 +854,11 @@ ALLOWED_DIVISION_MISMATCH = {
     # Eradication Agency → Asbestos and Silica Safety and Eradication Agency);
     # attribution is correct, the prefix matcher fires on the old name.
     ("Asbestos and Silica Safety and Eradication Agency", "Asbestos Safety and Eradication Agency"),
-    # ── TEMPORARY entries: known single-row misattributions, allowlisted only
-    # so this check can land green before the fix. Spec 07 item 7 reattributes
-    # both rows and DELETES these two pairs. Do not add new entries here
-    # without row-level evidence.
-    #
-    # 1 row: VN-0704814, 2022-05-05, "Executive Assistant - APS 6", raw agency
-    # = APSC, division = PWSS, branch null. Contemporaneous PWSS stand-up ads
-    # (Feb–Dec 2022, raw agency "Prime Minister and Cabinet", PWSS in branch)
-    # resolve to PWSS via BRANCH_OVERRIDE_PAIRS; this one names PWSS in
-    # *division*, which no pass inspects for a non-portfolio raw agency, so it
-    # stays on the host. Under the documented PWSS sub-entity exception it
-    # should be PWSS.
-    ("Australian Public Service Commission", "Parliamentary Workplace Support Service"),
-    # 1 row: VN-0700097, 2022-02-03, "Finance Officer", branch = "Office of
-    # the CEO", division = IHPA, raw agency = TGA (printed that way in the
-    # source PDF — verified against the raw parquet; fields parsed cleanly,
-    # so this is a gazette-source error, not a parse artefact). The role is
-    # plainly IHPA's; TGA and IHPA are unrelated bodies.
-    ("Therapeutic Goods Administration", "Independent Hospital Pricing Authority"),
+    # NOTE: VN-0704814 (APSC→PWSS) and VN-0700097 (TGA→IHPA) were formerly
+    # allowlisted here as temporary single-row misattributions. They are now
+    # reattributed at the row level in 05_apply_crosswalk.py
+    # (VACANCY_NO_OVERRIDES), so the mismatched pairs no longer appear in the
+    # scan and the allowlist entries have been removed.
 }
 
 
@@ -890,6 +987,59 @@ def get_agency_group(canonical: str | None) -> str | None:
     return AGENCY_GROUP.get(canonical, canonical)   # default: group == canonical
 
 
+def _lineage_rows() -> list[dict]:
+    """Flatten MOG_CHANGES into one row per (predecessor, successor) pair.
+
+    relation is taken from an explicit "relation" key if present, else derived:
+    "split" when the change has more than one successor, otherwise "rename".
+    Every predecessor/successor name must be in CANONICAL_AGENCIES (raises
+    otherwise, so a bad MOG_CHANGES edit fails the build rather than publishing a
+    broken lineage table).
+    """
+    canon = set(CANONICAL_AGENCIES)
+    rows = []
+    for key, change in MOG_CHANGES.items():
+        preds = change["predecessors"]
+        succs = change["successors"]
+        relation = change.get("relation") or ("split" if len(succs) > 1 else "rename")
+        for p in preds:
+            for s in succs:
+                for name, role in ((p, "predecessor"), (s, "successor")):
+                    if name not in canon:
+                        raise ValueError(
+                            f"MOG_CHANGES['{key}'] {role} {name!r} is not in "
+                            f"CANONICAL_AGENCIES"
+                        )
+                rows.append({
+                    "predecessor_canonical": p,
+                    "successor_canonical":   s,
+                    "effective_date":        change["effective"],
+                    "relation":              relation,
+                    "note":                  change["note"],
+                })
+    return rows
+
+
+def emit_lineage_csv(out_path: str = "data/agency_lineage.csv") -> pd.DataFrame:
+    """Write the machine-readable MoG predecessor/successor event table.
+
+    Factual events only — no split weights. Vacancy flows track functions and
+    stand-up timing, not headcount shares, so no defensible general-purpose
+    weight exists; the table records where the breaks are and what happened, not
+    how to apportion a series across them. See docs/data_dictionary.md.
+    """
+    lineage_df = pd.DataFrame(
+        _lineage_rows(),
+        columns=["predecessor_canonical", "successor_canonical",
+                 "effective_date", "relation", "note"],
+    )
+    lineage_df.to_csv(out_path, index=False, quoting=csv.QUOTE_ALL)
+    print(f"Wrote {out_path}  ({len(lineage_df)} rows)")
+    rel_counts = lineage_df["relation"].value_counts().to_dict()
+    print(f"  relations: {rel_counts}")
+    return lineage_df
+
+
 # ============================================================
 # SECTION 7 — MAIN: BUILD CROSSWALK FROM DATA
 # ============================================================
@@ -998,6 +1148,7 @@ def build_crosswalk(data_path: str = "data/gazette_vacancies_normalised.parquet"
     if not dry_run:
         crosswalk_df.to_csv(out_path, index=False, quoting=csv.QUOTE_ALL)
         print(f"\nSaved → {out_path}  ({len(crosswalk_df):,} rows)")
+        emit_lineage_csv()
     else:
         print("\n[dry-run] not saving")
 
@@ -1005,5 +1156,8 @@ def build_crosswalk(data_path: str = "data/gazette_vacancies_normalised.parquet"
 
 
 if __name__ == '__main__':
-    dry = '--dry-run' in sys.argv
-    build_crosswalk(dry_run=dry)
+    if '--lineage-only' in sys.argv:
+        emit_lineage_csv()
+    else:
+        dry = '--dry-run' in sys.argv
+        build_crosswalk(dry_run=dry)

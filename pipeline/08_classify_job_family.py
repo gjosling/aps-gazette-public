@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -44,6 +45,7 @@ CSV_PATH              = Path("data/release/aps_gazette_vacancies.csv.gz")
 CLASSIFICATIONS_PATH  = Path("data/job_family_classifications.parquet")
 OVERRIDES_PATH        = Path("data/job_family_overrides.csv")
 PROMPT_PATH           = Path("prompts/job_family_system.txt")
+PROMPT_VERSIONS_PATH  = Path("prompts/versions.json")
 BATCH_IDS_PATH        = Path("data/classify_batch_ids.json")
 
 VALID_JOB_FAMILIES = {
@@ -74,13 +76,15 @@ TIMEOUT          = 7_200
 PROMPT_VERSION   = "2025-v2"
 SYNC_THRESHOLD   = 1000   # use sync API when classifying fewer than this many rows
 
-# All columns stored in the classifications file (internal / private R2)
+# All columns stored in the classifications file (internal / private R2).
+# job_family_prompt_sha256 is private-only — deliberately NOT in PUBLIC_COLS.
 ALL_CLASSIFICATION_COLS = [
     "job_family",
     "job_family_confidence",
     "job_family_secondary",
     "job_family_model",
     "job_family_prompt_version",
+    "job_family_prompt_sha256",
     "job_family_raw_response",
     "job_family_classified_at",
 ]
@@ -93,6 +97,90 @@ PUBLIC_COLS = [
 ]
 
 _BRANCH_SKIP = {"", "nan", "none", "various", "na", "n/a"}
+
+
+# ---------------------------------------------------------------------------
+# Integrity gates
+# ---------------------------------------------------------------------------
+
+def prompt_file_sha256() -> str:
+    """sha256 of the committed prompt file."""
+    return hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest()
+
+
+def enforce_prompt_version() -> str:
+    """Require prompts/job_family_system.txt to match the hash registered for
+    PROMPT_VERSION in prompts/versions.json. Returns the verified hash; exits 1
+    on any mismatch, so an edit to the prompt without a version bump can never
+    silently change classifications."""
+    if not PROMPT_PATH.exists():
+        print(f"ERROR: {PROMPT_PATH} not found", file=sys.stderr)
+        sys.exit(1)
+    if not PROMPT_VERSIONS_PATH.exists():
+        print(f"ERROR: {PROMPT_VERSIONS_PATH} not found", file=sys.stderr)
+        sys.exit(1)
+    try:
+        registry = json.loads(PROMPT_VERSIONS_PATH.read_text())
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: could not parse {PROMPT_VERSIONS_PATH}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    actual = prompt_file_sha256()
+    expected = registry.get(PROMPT_VERSION)
+    if expected != actual:
+        print(
+            "ERROR: prompt file changed without a version bump — "
+            "add the new version+hash to prompts/versions.json and bump PROMPT_VERSION.\n"
+            f"  PROMPT_VERSION       = {PROMPT_VERSION}\n"
+            f"  registered  sha256   = {expected}\n"
+            f"  {PROMPT_PATH} sha256 = {actual}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return actual
+
+
+def _load_override_keys() -> set[str]:
+    """`gazette_id||vacancy_no` keys pinned by the overrides CSV (empty if absent)."""
+    if not OVERRIDES_PATH.exists():
+        return set()
+    ov = pd.read_csv(OVERRIDES_PATH, dtype=str)
+    return set(ov["gazette_id"].astype(str) + "||" + ov["vacancy_no"].astype(str))
+
+
+def check_collisions(df: pd.DataFrame, clf: pd.DataFrame) -> None:
+    """Collision tripwire: fail the build the day (gazette_id, vacancy_no) ever
+    stops identifying exactly one vacancy. gazette_id (PS1…PS52) repeats every
+    year and APSC could reuse a vacancy_no across a year boundary, which would
+    silently join an old label onto a new row. Zero collisions in six years of
+    data — this is a loud latent-risk guard, not an active fix. If it fires,
+    re-key the classification join (with a real collision in hand to design
+    against). Two cheap groupby checks, run every build."""
+    dup = clf.groupby(["gazette_id", "vacancy_no"]).size()
+    dup = dup[dup > 1]
+    if len(dup):
+        ex = ", ".join(f"{g}/{v}" for g, v in dup.index[:5])
+        print(f"ERROR: collision tripwire — {CLASSIFICATIONS_PATH.name} has "
+              f"{len(dup)} duplicated (gazette_id, vacancy_no) key(s): {ex}",
+              file=sys.stderr)
+        sys.exit(1)
+    years = pd.to_datetime(df["gazette_date"], errors="coerce").dt.year
+    span = (
+        pd.DataFrame({
+            "gazette_id": df["gazette_id"].astype(str),
+            "vacancy_no": df["vacancy_no"].astype(str),
+            "year":       years,
+        })
+        .dropna(subset=["year"])
+        .groupby(["gazette_id", "vacancy_no"])["year"].nunique()
+    )
+    span = span[span > 1]
+    if len(span):
+        ex = ", ".join(f"{g}/{v}" for g, v in span.index[:5])
+        print(f"ERROR: collision tripwire — {len(span)} (gazette_id, vacancy_no) "
+              f"key(s) span >= 2 gazette years in the release: {ex}. The join key "
+              f"no longer identifies one vacancy; re-key before continuing.",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +277,7 @@ def sync_classify(
     client: anthropic.Anthropic,
     to_classify: pd.DataFrame,
     system_prompt: str,
+    prompt_sha256: str,
 ) -> dict[tuple[str, str], dict]:
     """Classify rows one at a time using the synchronous Messages API."""
     results: dict[tuple[str, str], dict] = {}
@@ -238,6 +327,7 @@ def sync_classify(
             "job_family_secondary":      secondary,
             "job_family_model":          MODEL,
             "job_family_prompt_version": PROMPT_VERSION,
+            "job_family_prompt_sha256":  prompt_sha256,
             "job_family_raw_response":   raw,
             "job_family_classified_at":  datetime.now(timezone.utc).isoformat(),
         }
@@ -279,6 +369,7 @@ def retrieve_batch_results(
     client: anthropic.Anthropic,
     batch_ids: list[str],
     id_map: dict[str, tuple[str, str]],
+    prompt_sha256: str,
 ) -> dict[tuple[str, str], dict]:
     """Return {(gazette_id, vacancy_no): full classification fields}."""
     results: dict[tuple[str, str], dict] = {}
@@ -303,6 +394,7 @@ def retrieve_batch_results(
                     "job_family_secondary":      secondary,
                     "job_family_model":          MODEL,
                     "job_family_prompt_version": PROMPT_VERSION,
+                    "job_family_prompt_sha256":  prompt_sha256,
                     "job_family_raw_response":   raw,
                     "job_family_classified_at":  classified_at,
                 }
@@ -376,6 +468,13 @@ def run(
 ) -> None:
     print("=== 08 CLASSIFY JOB FAMILY ===")
 
+    # --- Prompt-integrity gate ---
+    # Refuse to run if the prompt file changed without a version bump. Runs before
+    # any load and before the --dry-run early return, so the negative test
+    # (edit the prompt → exit 1) fires even in --dry-run.
+    prompt_sha256 = enforce_prompt_version()
+    print(f"Prompt {PROMPT_VERSION} verified (sha256 {prompt_sha256[:12]}…)")
+
     # --- Load release parquet ---
     if not PARQUET_PATH.exists():
         print(f"ERROR: {PARQUET_PATH} not found", file=sys.stderr)
@@ -416,8 +515,30 @@ def run(
             clf = clf[~clf_keys.isin(keys_to_remove)].copy()
             print(f"--reclassify: cleared {n_existing:,} classifications matching filters")
 
+    # --- Backfill per-row prompt hash (one-time private-file migration) ---
+    # Only one prompt version has ever run, so every existing row carries the
+    # current hash. Adds the column to the classifications file the first time
+    # this runs; persisted immediately (even when nothing needs classifying) so
+    # the private parquet actually gains the column, but never during --dry-run.
+    if "job_family_prompt_sha256" not in clf.columns:
+        clf["job_family_prompt_sha256"] = prompt_sha256
+        if not dry_run:
+            CLASSIFICATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            clf.to_parquet(CLASSIFICATIONS_PATH, index=False)
+            print(f"Backfilled job_family_prompt_sha256 on {len(clf):,} existing rows "
+                  f"in {CLASSIFICATIONS_PATH.name}")
+
+    # --- Collision tripwire (runs every build, incl. --dry-run) ---
+    check_collisions(df, clf)
+
     # --- Determine unclassified rows ---
-    clf_keys = set(clf["gazette_id"].astype(str) + "||" + clf["vacancy_no"].astype(str))
+    # Treat rows whose job_family parsed to null as unclassified so they retry —
+    # unless the key is pinned by the overrides CSV. Parse failures are rare and
+    # re-attempts are idempotent and cheap; no attempt counter.
+    override_keys = _load_override_keys()
+    clf_all_keys = clf["gazette_id"].astype(str) + "||" + clf["vacancy_no"].astype(str)
+    is_classified = clf["job_family"].notna() | clf_all_keys.isin(override_keys)
+    clf_keys = set(clf_all_keys[is_classified])
     df_keys  = df["gazette_id"].astype(str) + "||" + df["vacancy_no"].astype(str)
     to_classify = df[~df_keys.isin(clf_keys)].copy()
     print(f"Rows needing classification: {len(to_classify):,}  ({len(df) - len(to_classify):,} already classified)")
@@ -470,7 +591,7 @@ def run(
 
         if use_sync:
             print("\n=== CLASSIFY (SYNC) ===")
-            results = sync_classify(client, to_classify, system_prompt)
+            results = sync_classify(client, to_classify, system_prompt, prompt_sha256)
             print(f"Total results: {len(results):,}")
         else:
             # Build custom_id → (gazette_id, vacancy_no) map
@@ -515,7 +636,7 @@ def run(
             poll_batches(client, batch_ids)
 
             print("\n=== RETRIEVE RESULTS ===")
-            results = retrieve_batch_results(client, batch_ids, id_map)
+            results = retrieve_batch_results(client, batch_ids, id_map, prompt_sha256)
             print(f"Total results retrieved: {len(results):,}")
 
         # Append new results to classifications file
@@ -527,13 +648,23 @@ def run(
         for col in ALL_CLASSIFICATION_COLS:
             if col not in new_rows.columns:
                 new_rows[col] = None
+        # Drop any stale rows for keys we just (re)classified before appending, so a
+        # retried null-family row is replaced, not duplicated — otherwise the concat
+        # would create a duplicate (gazette_id, vacancy_no) that the collision
+        # tripwire flags on the next run.
+        if len(new_rows):
+            new_keys = set(new_rows["gazette_id"].astype(str) + "||" + new_rows["vacancy_no"].astype(str))
+            existing_keys = clf["gazette_id"].astype(str) + "||" + clf["vacancy_no"].astype(str)
+            clf = clf[~existing_keys.isin(new_keys)].copy()
         clf = pd.concat([clf, new_rows], ignore_index=True)
 
         CLASSIFICATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
         clf.to_parquet(CLASSIFICATIONS_PATH, index=False)
-        n_with_family = clf["job_family"].notna().sum()
+        n_with_family = int(clf["job_family"].notna().sum())
+        n_null_family = len(clf) - n_with_family
         print(f"Classifications file: {len(clf):,} rows "
-              f"({n_with_family:,} classified, {len(clf) - n_with_family:,} pending retry)")
+              f"({n_with_family:,} classified, {n_null_family:,} null-family — "
+              f"retried on the next run unless pinned in {OVERRIDES_PATH.name})")
         print(f"Written: {CLASSIFICATIONS_PATH}")
 
         if not use_sync and BATCH_IDS_PATH.exists():

@@ -92,6 +92,7 @@ PUSH_PUBLIC = [
     ("data/release/aps_gazette_vacancies.parquet",   "gazette/aps_gazette_vacancies.parquet"),
     ("data/release/aps_gazette_vacancies.csv.gz",    "gazette/aps_gazette_vacancies.csv.gz"),
     ("data/release/aps_gazette_vacancies.meta.json", "gazette/aps_gazette_vacancies.meta.json"),
+    ("data/agency_lineage.csv",                      "gazette/agency_lineage.csv"),
     ("docs/CHANGELOG.md",                            "gazette/CHANGELOG.md"),
 ]
 

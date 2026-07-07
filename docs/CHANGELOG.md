@@ -13,6 +13,43 @@ dataset-version bump.
 - **2026-07-06** — Build-time validation suite added; releases can no longer
   publish with failing checks.
 
+## 1.5.0 — 2026-07-07
+- **Added:** `ps_act_employer` flag — boolean, True where the employing entity
+  engages staff under the *Public Service Act 1999*, False for own-Act employers,
+  Commonwealth companies and Parliamentary Service Act departments; null only where
+  `agency_canonical` is null. Use it to filter APS-classification analysis — the
+  own-Act employers with no APS classification (e.g. ACECQA, ANSTO, NHVR, the land
+  councils) are ~100% null in `classification_code`.
+- **Fixed:** the single 2020 Hearing Australia row now resolves to a canonical
+  agency (was null); 2 single-row agency misattributions reattributed
+  (VN-0704814 → Parliamentary Workplace Support Service; VN-0700097 → Independent
+  Hospital Pricing Authority).
+- **Internal:** a collision tripwire fails the build if `(gazette_id, vacancy_no)`
+  ever stops identifying one vacancy; failed classification parses now retry;
+  prompt-file integrity enforced by hash (`prompts/versions.json`); recently
+  not-found gazette dates are re-probed for 28 days.
+
+## 1.4.0 — 2026-07-07
+- **Added:** `agency_lineage.csv` — machine-readable MoG predecessor/successor
+  event table (renames, merges, splits; deliberately no split weights — see the
+  data dictionary). Published beside the release; generated from the `MOG_CHANGES`
+  table in `pipeline/04_build_crosswalk.py`.
+- **Changed:** 75 pre-July-2022 rows (73 Australian Antarctic Division + 2
+  Department of the Environment and Energy) move from Department of Climate Change,
+  Energy, the Environment and Water / `"Climate and environment department"` to
+  Department of Agriculture, Water and the Environment / `"Agriculture department"`,
+  fixing an inconsistency where DCCEEW had a spurious pre-2022 trickle. Two
+  published time series change: DCCEEW pre-2022-07 count is now 0; the Agriculture
+  department group gains 75 rows in 2020–2022.
+- **Changed:** the Infrastructure department canonical was renamed to its current
+  official name, "Department of Infrastructure, Transport, Regional Development,
+  Communications, Sport and the Arts" (sport transferred from the Health portfolio,
+  effective 2025-05-13). All 1,379 rows across the three name eras (DITRDC →
+  DITRDCA → DITRDCSA) relabel to this name; **no rows move**. The two earlier
+  names remain as zero-row canonical members. A `DITRDCA → DITRDCSA` lineage row
+  (rename) was added — the lineage table now has 14 rows. The chain is presented
+  as one continuous series under the current name; see the data dictionary.
+
 ## 1.3.0 — 2026-07-07
 - **Changed:** `description_clean` method v2 (`2026-07-v2`) adds a corpus-wide
   boilerplate pass. Fixes residual May-2025 gazette-template eligibility text that
