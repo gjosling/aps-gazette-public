@@ -382,6 +382,41 @@ def check_am_groups(df, exp) -> list:               # 5 (activates after affirma
     return findings
 
 
+def check_posting_kind(df, exp) -> list:            # 9 (activates after posting_kind lands)
+    """posting_kind category-count and flagged-share bounds (WARN), plus a strict
+    value-set check (FAIL — any value outside {register, entry_program, bulk_round,
+    null} is a code bug, not drift). Dormant while expectations.posting_kind is null."""
+    cfg = exp.get("posting_kind")
+    if cfg is None:
+        return []
+    if "posting_kind" not in df.columns:
+        return [Finding(FAIL, "posting_kind",
+                        "expectations.posting_kind is set but column missing "
+                        "(posting_kind derivation step did not run — build ordering violated)")]
+    findings = []
+    pk = df["posting_kind"]
+    allowed = {"register", "entry_program", "bulk_round"}
+    bad = sorted(set(pk.dropna().unique()) - allowed)
+    if bad:
+        findings.append(Finding(FAIL, "posting_kind unexpected values", f"{bad}"))
+
+    counts = pk.value_counts(dropna=True)
+    for cat in ("register", "entry_program", "bulk_round"):
+        n = int(counts.get(cat, 0))
+        lo, hi = cfg.get(f"min_{cat}"), cfg.get(f"max_{cat}")
+        if lo is not None and n < lo:
+            findings.append(Finding(WARN, f"posting_kind {cat} (low)", f"got {n}, expected >= {lo}"))
+        if hi is not None and n > hi:
+            findings.append(Finding(WARN, f"posting_kind {cat} (high)", f"got {n}, expected <= {hi}"))
+
+    max_pct = cfg.get("max_flagged_pct")
+    if max_pct is not None:
+        pct = pk.notna().sum() / len(df) * 100 if len(df) else 0.0
+        if pct > max_pct:
+            findings.append(Finding(WARN, "posting_kind flagged share", f"{pct:.2f}%, expected <= {max_pct}%"))
+    return findings
+
+
 def check_boilerplate_residual(df, exp) -> list:    # 6
     """Boilerplate-residual ceiling. Skipped (with an explicit line) when
     description_clean is absent — it does not exist in 06's DataFrame; the real
@@ -432,6 +467,7 @@ def validate_release(df, expectations) -> list:
     _report("lineage table integrity", check_lineage(df, expectations), findings)
     _report("pre-2022-07 DCCEEW guard", check_premog_dcceew(df, expectations), findings)
     _report("AM-group bounds", check_am_groups(df, expectations), findings)
+    _report("posting_kind bounds", check_posting_kind(df, expectations), findings)
     # check 6 prints its own SKIP line when description_clean is absent
     bp = check_boilerplate_residual(df, expectations)
     if "description_clean" in df.columns:
@@ -594,6 +630,21 @@ def print_current(expectations, release_path=RELEASE_PARQUET) -> None:
         }
     else:
         observed["am_linkage"] = None
+
+    if "posting_kind" in df.columns:
+        pk = df["posting_kind"]
+        counts = pk.value_counts(dropna=True)
+        observed["posting_kind"] = {
+            "min_register": int(counts.get("register", 0)),
+            "max_register": int(counts.get("register", 0)),
+            "min_entry_program": int(counts.get("entry_program", 0)),
+            "max_entry_program": int(counts.get("entry_program", 0)),
+            "min_bulk_round": int(counts.get("bulk_round", 0)),
+            "max_bulk_round": int(counts.get("bulk_round", 0)),
+            "max_flagged_pct": round(pk.notna().sum() / len(df) * 100, 1) if len(df) else 0.0,
+        }
+    else:
+        observed["posting_kind"] = None
 
     print(json.dumps(observed, indent=2))
 

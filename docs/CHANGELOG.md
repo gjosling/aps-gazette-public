@@ -13,6 +13,29 @@ dataset-version bump.
 - **2026-07-06** — Build-time validation suite added; releases can no longer
   publish with failing checks.
 
+## 1.7.0 — 2026-07-14
+- **Changed:** `description_clean` method `2026-07-v3`, fixing two signal-loss bugs.
+  A fused inline section header (e.g. "About the Role We have a number of roles
+  available…", no punctuation between header and sentence) previously caused the
+  whole unit — header and the substantive sentence after it — to be dropped; only
+  the header is dropped now. Separately, template sentences that also assert a
+  substantive fact about the posting (e.g. "There are multiple vacancies
+  available…", register/expression-of-interest/graduate-program/identified-position
+  statements) are no longer stripped just because an agency standardised the
+  wording. **26,867 of 87,315** described rows have a changed `description_clean`
+  as a result; raw `description` is unaffected. See the data dictionary's
+  `description_clean` method note for details.
+- **Internal:** the boilerplate audit CSV's `half_year` column is renamed `quarter`
+  (the binning was always quarterly; the old name and related prose were wrong),
+  gained a `protected` column, and the pipeline now logs aggregate header-removal
+  counts that were previously invisible.
+
+## 1.6.0 — 2026-07-14
+- **Added:** `posting_kind` — flags standing registers, entry-program intakes
+  and bulk multi-position ads (~7% of rows at release time). Segmentation flag
+  only; not a count correction — see the data dictionary. No existing column
+  changed.
+
 ## 1.5.0 — 2026-07-07
 - **Added:** `ps_act_employer` flag — boolean, True where the employing entity
   engages staff under the *Public Service Act 1999*, False for own-Act employers,

@@ -119,6 +119,155 @@ def add_am_linkage(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ── posting_kind (spec 08) ──────────────────────────────────────────────
+# Flags posting STRUCTURE, not seniority. Precedence: register >
+# entry_program > bulk_round. Null = standard posting as far as the
+# markers can tell — not a guarantee. Segmentation flag, NOT a count fix.
+
+# ---------- register ----------
+REGISTER_RE = re.compile(
+    r'(?i)\bregisters?\b'
+    r'|talent\s+(?:pool|pipeline)s?\b'
+    r'|\beoi\b|expressions?\s+of\s+interest'
+    r'|temporary\s+employment(?:\s+registers?|\s+\d{4}|\s*$)'   # "Temporary Employment 2022 - 2023"
+    r'|merit\s+pool\s*$'
+)
+# Named registers as subject matter (roles about a register, not pool postings).
+# Observed allowlist — audited row-by-row this session; re-harvest when extending markers.
+REGISTER_EXCLUDE_RE = re.compile(
+    r'(?i)federal\s+register\s+of\s+legislation'
+    r'|national\s+cancer\s+screening\s+register'
+    r'|business\s+register'                 # ABS Business Register Unit/Analyst
+    r'|national\s+firearms\s+register'
+    r'|self.?exclusion\s+register'
+    r'|address\s+register'                  # ABS Address Register
+    r'|security\s+register\s+assessor'      # IRAP assessor
+    r'|register\s+development'
+    r'|register\s+of\s+environmental\s+organisations'  # briefed FP class; 0 rows observed, guard kept
+    r'|deputy\s+register\b'                 # "Deputy Register Human Source Capability" (Registrar typo)
+)
+
+# ---------- entry_program ----------
+EP_SHIP_RE = re.compile(r'(?i)\b(?:apprenticeship|cadetship|traineeship)s?\b')
+EP_ROLEWORD_RE = re.compile(r'(?i)\b(?:apprentice|cadet|trainee)s?\b')
+EP_GRAD_STRUCT_RE = re.compile(
+    r'(?i)\bgraduates?\b[\w\s,&/()\'\u2019\u2013\u2014-]*?\b(?:program(?:me)?s?|intakes?|pathways?|streams?|recruitment|cohorts?)\b'
+    r'|\b(?:program(?:me)?s?|intakes?|pathways?|streams?)\b[\w\s,&/()\'\u2019\u2013\u2014-]*?\bgraduates?\b'
+    r'|\bAGGP\b'
+)
+EP_OTHER_STRUCT_RE = re.compile(
+    r'(?i)entry.?level\s+professional\s+program'    # ABARES ELPP; bare "entry level program(s)" is a team name
+    r'|\bintern(?:ship)?s?\b'
+    r'|school\s+leaver'
+    # "development program" only when NOT immediately governed by an admin-role noun
+    r'|development\s+program(?:me)?s?\b(?!\s*(?:\([\w &]*\)\s*)?(?:managers?|co-?ordinators?|administrators?|directors?|liaison|support\s+officers?|officers?|advis[eo]rs?|leads?)\b)'
+    r'|\brecruits?\b'                               # BFORT family, Lateral Recruits ("recruitment" not matched)
+    # named diversity/identified intakes — observed allowlist, re-harvest when new programs appear
+    r'|first\s+nations\s+pathway\s+program'
+    r'|directions\s+program'                        # AFP Directions Program
+    r'|veterans?[\u2019\']?s?\s+employment\s+pathway'
+)
+# Admin-word set is deliberately narrow: adding officer/support/executive was tested and
+# rejected (kills "Border Force Officer Recruit Trainee", "Trainee Administration Officer").
+EP_ADMIN_WORDS  = r'(?:co-?ordinators?|managers?|mentors?|team\s+lead(?:er)?s?|(?:assistant\s+)?directors?)'
+EP_MARKER_WORDS = r'(?:graduates?|apprentice(?:ship)?s?|cadet(?:ship)?s?|trainee(?:ship)?s?|intern(?:ship)?s?)'
+EP_EXCLUDE_RE = re.compile(
+    r'(?i)\b' + EP_ADMIN_WORDS + r'\b[\w\s,&/()\'\u2019\u2013\u2014|-]*\b' + EP_MARKER_WORDS + r'\b'
+    r'|\b' + EP_MARKER_WORDS + r'\b[\w\s,&/()\'\u2019\u2013\u2014|-]*\b' + EP_ADMIN_WORDS + r'\b'
+    r'|(?:ADF|Defence\s+Force|Army|Navy|Air\s+Force)\s+Cadets?\b'       # ADF Cadets youth organisation
+    r'|Cadets?\s+(?:Directorate|Brigade|Branch|Governance|Engagement|Support)'
+    r'|Apprenticeships\s+(?:Policy|Team)'                                # DEWR Australian Apprenticeships policy area
+    r'|Recruit\s+Administration'                                         # Army 1 RTB admin role
+    r'|Work\s+Experience\s+(?:Liaison|Co-?ordinator|Manager|Administration)'
+    r'|^\s*(?:advis[eo]r|assistant\s+director|director|manager|co-?ordinator)s?\s*[,:\u2013\u2014-]\s*(?=.*development\s+program)'
+)
+CC_TRAINING_RE = re.compile(r'(?i)graduate|cadet\s+aps|trainee\s+aps|apprentice\s+aps|aboriginal\s+cadet')
+
+def bare_graduate(title: str) -> bool:
+    """True when the title's residue is just 'graduate(s)' after stripping decoration —
+    asserting intake structure, not a role (e.g. 'NDIA APS4 Graduate (AM - First Nations)')."""
+    if not isinstance(title, str) or not re.search(r'(?i)\bgraduates?\b', title):
+        return False
+    t = title
+    t = re.sub(r'\([^)]*\)', ' ', t)
+    t = re.sub(r'(?i)[-\u2013\u2014,:]\s*affirmative\s+measures?\b.*$', ' ', t)
+    t = re.sub(r'(?i)[-\u2013\u2014,:]\s*(?:identified|indigenous\s+targeted).*$', ' ', t)
+    t = re.sub(r'(?i)\b(?:aps|el)\s*\d(?:\s*[/;-]\s*(?:aps|el)?\s*\d)*\b', ' ', t)
+    t = re.sub(r'(?i)\b(?:first\s+nations|indigenous|aboriginal(?:\s+and\s+torres\s+strait\s+islander)?)\b', ' ', t)
+    t = re.sub(r'\b(?:19|20)\d{2}(?:\s*[-/]\s*\d{2,4})?\b|\b0\d\d\b', ' ', t)   # years incl. OCR-mangled ("026 First Nations Graduate")
+    t = re.sub(r'\b[A-Z]{2,6}\b', ' ', t)     # ALL-CAPS acronyms only — NOT case-insensitive (a (?i) here strips ordinary words)
+    t = re.sub(r'[^A-Za-z]+', ' ', t).strip().lower()
+    return t in ("graduate", "graduates", "graduate aps", "aps graduate", "aps graduates")
+
+# ---------- bulk_round ----------
+BULK_TITLE_RE = re.compile(
+    r'(?i)bulk\s+(?:round|recruitment|positions?|vacancies|intake)'
+    r'|\(\s*bulk(?:\s+round)?\s*\)|[-\u2013\u2014]\s*bulk\s*$'
+    r'|recruitment\s+round'
+    r'|\b(?:multiple|several|various|numerous)\s+(?:[\w./&-]+\s+){0,3}(?:positions?|vacancies|roles?|opportunit(?:y|ies)|classifications?|levels?|jobs?)\b'
+    r'|\(\s*(?:multiple|several|various)\s*\)|\b(?:multiple|several|various)\s*$'
+    r'|^\s*(?:multiple|several|various)\s*(?:[-\u2013\u2014:]|$)'
+    r'|\b\d+\s*x\s+\w|\bx\s*\d+\b|\(\s*\d+\s*x'                     # "2 x Anthropologists", "(x2)", "X3"
+)
+BULK_TITLE_EXCLUDE_RE = re.compile(
+    r'(?i)bulk\s+(?:print|material|billing|cargo|fuel)'             # "Passport Bulk Print", "Bulk Material Analysis"
+    r'|multiple\s+sclerosis'
+)
+BULK_DESC_RE = re.compile(   # applied to raw `description` — see spec text
+    r'(?i)(?:seeking\s+to\s+fill|filling|we\s+have|there\s+are|recruit(?:ing)?(?:\s+for)?|now\s+recruiting)\s+multiple\s+(?:positions?|vacancies|roles?)'
+    r'|multiple\s+(?:positions?|vacancies|roles?)\s+(?:are\s+)?(?:currently\s+)?available'
+    # anchored: bare "bulk recruitment" also appears as past-reference boilerplate and in
+    # recruitment-team duty statements; "through/via" anchors tested and removed (matched
+    # "previously applied through the bulk recruitment process")
+    r'|(?:conducting|undertaking|undergoing|running|commenced|part\s+of|this\s+is)\s+(?:a\s+|the\s+)?bulk\s+recruitment'
+    r'|(?:fill\s+)?a\s+number\s+of\s+(?:positions?|vacancies|roles)\s+(?:are\s+available|available|at\s|across|within|in\b)'
+    r'|fill\s+a\s+number\s+of\s+(?:positions?|vacancies|roles)'
+    r'|various\s+(?:positions?|vacancies|roles)\s+(?:are\s+)?(?:currently\s+)?available'
+    r'|(?:seeking\s+to\s+fill|fill(?:ing)?)\s+various\s+(?:positions?|vacancies|roles)'
+)
+
+def derive_posting_kind(df: pd.DataFrame) -> pd.Series:
+    # .astype(object): pandas' default pyarrow-backed string dtype routes .str.contains
+    # through RE2, which rejects the \uXXXX escapes used below (and lacks lookahead
+    # support); object dtype restores the Python `re` engine. No regex logic changes.
+    t  = df["job_title"].fillna("").astype(object)
+    cc = df["classification_code"].fillna("").astype(object)
+    d  = df["description"].fillna("").astype(object)          # RAW text, deliberately (stage 06; see spec)
+
+    is_register = t.str.contains(REGISTER_RE) & ~t.str.contains(REGISTER_EXCLUDE_RE)
+
+    ep_title = (t.str.contains(EP_SHIP_RE) | t.str.contains(EP_ROLEWORD_RE)
+                | t.str.contains(EP_GRAD_STRUCT_RE) | t.str.contains(EP_OTHER_STRUCT_RE)
+                | t.map(bare_graduate))
+    # cc training classification is authoritative: promotes ambiguous titles AND overrides
+    # the title-level admin excluder ("Apprentice Turf Manager", cc="Apprentice APS (Trades)").
+    is_ep = (ep_title & ~t.str.contains(EP_EXCLUDE_RE)) | cc.str.contains(CC_TRAINING_RE)
+
+    is_bulk = (t.str.contains(BULK_TITLE_RE) & ~t.str.contains(BULK_TITLE_EXCLUDE_RE)) | d.str.contains(BULK_DESC_RE)
+
+    out = pd.Series(pd.NA, index=df.index, dtype="object")
+    out[is_bulk]     = "bulk_round"
+    out[is_ep]       = "entry_program"   # entry_program > bulk_round
+    out[is_register] = "register"        # register > entry_program
+    return out
+
+
+def add_posting_kind(df: pd.DataFrame) -> pd.DataFrame:
+    """Add posting_kind, placed immediately after posting_group_id."""
+    df = df.copy()
+    df["posting_kind"] = derive_posting_kind(df)
+
+    cols = [c for c in df.columns if c != "posting_kind"]
+    pgi = cols.index("posting_group_id")
+    cols = cols[:pgi + 1] + ["posting_kind"] + cols[pgi + 1:]
+    df = df[cols]
+
+    counts = df["posting_kind"].value_counts(dropna=True)
+    n_flagged = int(df["posting_kind"].notna().sum())
+    print(f"posting_kind: {dict(counts)} ({n_flagged / len(df) * 100:.2f}% flagged)")
+    return df
+
+
 def run():
     df = pd.read_parquet(SRC)
     print(f"Loaded {SRC}: {len(df):,} rows, {len(df.columns)} cols")
@@ -209,6 +358,10 @@ def run():
     # ── Affirmative-measures linkage ──────────────────────────────────────────────
 
     df = add_am_linkage(df)
+
+    # ── Posting-structure flag ──────────────────────────────────────────────────
+
+    df = add_posting_kind(df)
 
     # ── Validation ────────────────────────────────────────────────────────────────
     #

@@ -12,5 +12,11 @@
     "since": "2025-07-01",
     "max_pct_of_descriptions_clean": 0.5
   },
-  "am_linkage": {"min_am_rows": 3452, "min_groups": 2000, "max_groups": 3800}
+  "am_linkage": {"min_am_rows": 3452, "min_groups": 2000, "max_groups": 3800},
+  "posting_kind": {
+    "min_register": 900,  "max_register": 1650,
+    "min_entry_program": 590, "max_entry_program": 1100,
+    "min_bulk_round": 3100, "max_bulk_round": 5700,
+    "max_flagged_pct": 10.0
+  }
 }

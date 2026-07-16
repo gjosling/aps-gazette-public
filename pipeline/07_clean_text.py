@@ -10,10 +10,15 @@ Boilerplate method (two passes; effective set = per-agency ∪ global)
 -------------------------------------------------------------------
 Per-agency pass:
 1. Split each description into sentences (paragraph → newline → sentence-boundary).
+   An inline "About the/our/us <section>" header fused to the following sentence
+   by the absence of punctuation (e.g. "About the Role We have...") is split from
+   it here, so the header can be dropped without deleting the body (see
+   _ABOUT_HEADER_SPLIT_RE) — before this fix the whole fused unit was discarded.
 2. Strip section-label prefixes ("Duties", "Eligibility", "Notes") and drop sentences
-   that begin with "About the/our/us" (agency mission section header).
+   that begin with "About the/our/us" (agency mission section header) — now only
+   ever a genuine standalone header unit, per (1).
 3. Normalise each sentence (lowercase, replace punctuation with spaces, collapse whitespace).
-4. Bin ads by agency_canonical × half-year period.
+4. Bin ads by agency_canonical × quarter period.
 5. Count how many distinct ads in each bin contain each normalised sentence.
 6. For sentences exceeding THRESHOLD in any qualifying bin (≥ MIN_BIN ads), also count
    distinct normalised job titles in that highest-fraction bin.
@@ -23,14 +28,17 @@ Per-agency pass:
 
 Global pass (review finding F4): the per-agency method can never learn
 gazette-wide template text for small agencies (their bins fall below MIN_BIN). A
-corpus-level pass bins ALL ads by half-year and flags a normalised sentence when,
+corpus-level pass bins ALL ads by quarter and flags a normalised sentence when,
 in any bin (≥ GLOBAL_MIN_BIN_ADS ads), it appears in ≥ GLOBAL_THRESHOLD of the
 bin AND spans ≥ GLOBAL_MIN_TITLES distinct job titles. The global set applies to
 every agency, including sub-MIN_BIN ones. It catches the RecruitAbility standard
 passage and the May-2025 gazette eligibility passage. Global-pass audit rows use
 agency_canonical = "__GLOBAL__".
 
-8. Reconstruct description_clean by joining the sentences flagged by neither pass.
+8. Reconstruct description_clean by joining the sentences flagged by neither pass
+   and not matching PROTECTED_RE (multi-position, pool/register, intake-structure
+   or eligibility markers) — a protected sentence is never stripped even if
+   frequency-flagged; it is still listed in the audit CSV with protected=True.
 
 Ads with null description get null description_clean.
 
@@ -83,16 +91,18 @@ AUDIT_CSV     = AUDIT_DIR / "boilerplate_sentences.csv"   # stable name (diff wo
 # the .meta.json sidecar) and used in the dated audit-CSV filename. BUMP THIS
 # constant on ANY change to the thresholds, sentence splitting/normalisation, or
 # pass structure — it is the only marker that description_clean was recomputed by a
-# different method. v2 added the global corpus-wide pass (bumped from v1).
-BOILERPLATE_METHOD_VERSION = "2026-07-v2"
+# different method. v2 added the global corpus-wide pass (bumped from v1). v3
+# (spec 09 Phase B) fixed the fused About-header segmenter bug and added the
+# PROTECTED_RE guard — see CHANGELOG.
+BOILERPLATE_METHOD_VERSION = "2026-07-v3"
 
 DEFAULT_THRESHOLD  = 0.30
 DEFAULT_MIN_TITLES = 3
 MIN_BIN            = 10      # bins smaller than this are never used for flagging
-BIN_PERIOD         = "2Q"    # half-year (change to "Q" for quarterly)
+BIN_PERIOD         = "Q"     # quarterly (pd.to_period freqstr)
 
-# Global (corpus-wide) pass. Bins ALL ads by half-year; no MIN_BIN needed
-# (every half-year bin has thousands of ads), but degenerate partial periods are
+# Global (corpus-wide) pass. Bins ALL ads by quarter; no MIN_BIN needed
+# (every quarterly bin has thousands of ads), but degenerate partial periods are
 # skipped via GLOBAL_MIN_BIN_ADS.
 DEFAULT_GLOBAL_THRESHOLD  = 0.40   # ≥40% of a corpus bin; below this, one dominant
                                    # agency's own blurb can cross the bar (see spec)
@@ -112,6 +122,35 @@ _ABOUT_HEADER_RE = re.compile(r'^About\s+(?:the|our|us)\b', re.IGNORECASE)
 # does not handle abbreviations (e.g. "Dr.", "e.g.") to keep the regex simple.
 _SENT_RE         = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
 
+# 09A diagnosis (Step 4): when an inline "About the/our/us <section>" header has
+# no sentence-ending punctuation before the sentence that follows it (e.g. "About
+# the Role We have a number of roles available…"), _SENT_RE can't split them, so
+# _ABOUT_HEADER_RE (below) used to drop the whole fused unit — header AND body —
+# unconditionally, deleting substantive, non-boilerplate content. This regex
+# peels a bounded header noun-phrase off the front of a fused unit so the body
+# becomes its own unit and reaches the frequency pass like any other sentence.
+# It only fires on an enumerated set of section-header nouns (a genuine
+# standalone header, e.g. "About the Australian Antarctic Division", has no
+# trailing content and so never matches — it still falls through to
+# _ABOUT_HEADER_RE's whole-unit drop, which remains correct for that case).
+_ABOUT_HEAD_NOUN = (
+    r'(?:(?:team|role|position|department|division|branch|group|directorate|unit|'
+    r'agency|organisation|organization|section|office|program|programme|'
+    r'authority|commission|bureau|area|tribunal|person)s?'
+    r'|opportunit(?:y|ies))'
+)
+# Words that start a new sentence rather than continue an "of <name>" phrase
+# (e.g. "About the Department of Parliamentary Services The Department…" must
+# stop the header at "Services", not swallow "The Department").
+_SENT_START_WORD = r'(?:the|this|that|these|those|it|they|we|you|our|your|a|an)'
+_ABOUT_HEADER_SPLIT_RE = re.compile(
+    rf'^(About\s+(?:the|our|us)\s+(?:[A-Za-z][\w\'&-]*\s+){{0,3}}?{_ABOUT_HEAD_NOUN}'
+    rf'(?:\s+of\s+(?:(?!{_SENT_START_WORD}\b)[A-Za-z][\w\'&-]*)'
+    rf'(?:\s+(?!{_SENT_START_WORD}\b)[A-Za-z][\w\'&-]*){{0,4}})?)'
+    rf'\s*:?\s+(?=\S)',
+    re.IGNORECASE,
+)
+
 # Strip trailing location suffix ("- Melbourne CBD, Victoria") and year prefix ("2023 - ")
 _TITLE_LOCATION_RE = re.compile(r'\s*-\s*[a-z][a-z ,]+(?:,\s*[a-z ]+)?$')
 _TITLE_YEAR_RE     = re.compile(r'^\d{4}\s*-\s*')
@@ -125,8 +164,26 @@ def _strip_inline_header(sentence: str) -> str | None:
     return s if s else None
 
 
-def split_sentences(text: str) -> list[str]:
-    """Split description text into sentences after inline-header stripping."""
+def _split_fused_header(part: str) -> list[str]:
+    """Peel a fused inline About-header off the front of `part` (see
+    _ABOUT_HEADER_SPLIT_RE) so the following sentence becomes its own unit.
+    Returns [part] unchanged if there's no recognised fused header, or if the
+    header has no trailing body (a genuine standalone header)."""
+    m = _ABOUT_HEADER_SPLIT_RE.match(part)
+    if not m:
+        return [part]
+    head = m.group(1).strip()
+    rest = part[m.end():].strip()
+    return [head, rest] if rest else [part]
+
+
+def split_sentences(text: str, stats: dict | None = None) -> list[str]:
+    """Split description text into sentences after inline-header stripping.
+
+    `stats`, if given, is incremented in place with counts of units dropped
+    by the About-header whole-unit rule (`about_header`) and by the
+    empty-after-label-strip rule (`label_empty`) — used to log the
+    otherwise-invisible header removal path (see 09A diagnosis Step 3/B.3)."""
     if not isinstance(text, str):
         return []
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -137,8 +194,16 @@ def split_sentences(text: str) -> list[str]:
             if not line:
                 continue
             for part in _SENT_RE.split(line):
-                s = _strip_inline_header(part.strip())
-                if s:
+                part = part.strip()
+                if not part:
+                    continue
+                for unit in _split_fused_header(part):
+                    s = _strip_inline_header(unit)
+                    if s is None:
+                        if stats is not None:
+                            key = "about_header" if _ABOUT_HEADER_RE.match(unit) else "label_empty"
+                            stats[key] = stats.get(key, 0) + 1
+                        continue
                     out.append(s)
     return out
 
@@ -202,6 +267,35 @@ def redact_pii(text: str | None) -> str | None:
     text = _PHONE_RE.sub("[phone redacted]", text)
     text = _CONTACT_NAME_RE.sub(_redact_contact_name, text)
     return text
+
+
+# ── Protected-phrase guard (spec 09 B.1) ────────────────────────────────────────
+#
+# Some sentences are simultaneously template (frequency-flagged) AND substantive
+# (assert a fact about the posting — multi-position, pool/register, intake
+# structure, eligibility). A sentence matching PROTECTED_RE is never stripped,
+# regardless of frequency; it stays listed in the audit record (protected=True)
+# so the record remains informative about template frequency, but the stripping
+# is suppressed. See 09A diagnosis Step 5(c) for the size of this carve-out.
+#
+# The merit-pool alternation ("a merit pool may be created…") is deliberately
+# EXCLUDED: it is near-universal legal-adjacent boilerplate that is only weakly
+# informative on its own (spec 08 already declines to treat it as a bulk-posting
+# marker), and protecting it would visibly inflate clean-text length across ~35
+# heavily-templated entries for little analytical value — a bad trade against
+# the ~25 flagged entries the rest of the pattern protects.
+PROTECTED_RE = re.compile(
+    r'(?i)'
+    r'multiple\s+(?:positions?|vacancies|roles?)'
+    r'|(?:a\s+)?number\s+of\s+(?:positions?|vacancies|roles)'
+    r'|various\s+(?:positions?|vacancies|roles)'
+    r'|bulk\s+recruitment'
+    r'|current\s+and\s+anticipated\s+vacanc'
+    r'|(?:employment|talent)\s+register'
+    r'|expressions?\s+of\s+interest'
+    r'|graduate\s+program|apprenticeship|cadetship|traineeship|school\s+leaver'
+    r'|identified\s+position'
+)
 
 
 # ── Boilerplate detection ──────────────────────────────────────────────────────
@@ -272,16 +366,18 @@ def build_boilerplate_sets(
             is_flagged = n_titles >= min_title_diversity
             if is_flagged:
                 flagged.add(ns)
+            original = sent_original.get(ns, "")
             audit_rows.append({
                 "agency_canonical":    agency,
-                "half_year":           period_str,
+                "quarter":             period_str,
                 "sentence_normalised": ns,
                 "n_ads":               n_ads,
                 "bin_size":            bin_size,
                 "pct_of_bin":          round(frac * 100, 1),
                 "n_titles":            n_titles,
                 "flagged":             is_flagged,
-                "sentence_original":   sent_original.get(ns, ""),
+                "protected":           bool(PROTECTED_RE.search(original)),
+                "sentence_original":   original,
             })
 
         agency_bp[agency] = frozenset(flagged)
@@ -298,7 +394,7 @@ def build_global_boilerplate_set(
 ) -> tuple[frozenset[str], list[dict]]:
     """
     Corpus-level boilerplate pass (review finding F4). Bins ALL ads (no agency
-    split) by half-year and returns the set of normalised sentences that, in any
+    split) by quarter and returns the set of normalised sentences that, in any
     qualifying bin (≥ min_bin_ads ads):
       - appear in ≥ global_threshold fraction of that bin's ads, AND
       - span ≥ global_min_titles distinct normalised job titles in that
@@ -360,16 +456,18 @@ def build_global_boilerplate_set(
         is_flagged = n_titles >= global_min_titles
         if is_flagged:
             flagged.add(ns)
+        original = sent_original.get(ns, "")
         audit_rows.append({
             "agency_canonical":    GLOBAL_AGENCY_SENTINEL,
-            "half_year":           period_str,
+            "quarter":             period_str,
             "sentence_normalised": ns,
             "n_ads":               n_ads,
             "bin_size":            bin_size,
             "pct_of_bin":          round(frac * 100, 1),
             "n_titles":            n_titles,
             "flagged":             is_flagged,
-            "sentence_original":   sent_original.get(ns, ""),
+            "protected":           bool(PROTECTED_RE.search(original)),
+            "sentence_original":   original,
         })
 
     return frozenset(flagged), audit_rows
@@ -380,11 +478,14 @@ def build_global_boilerplate_set(
 def clean_description(
     description: str | None,
     boilerplate: frozenset[str],
+    stats: dict | None = None,
 ) -> str | None:
     if not isinstance(description, str):
         return None
-    sents = split_sentences(description)
-    kept  = [s for s in sents if normalise(s) not in boilerplate]
+    sents = split_sentences(description, stats=stats)
+    # Protected sentences are never stripped, even if frequency-flagged — see
+    # PROTECTED_RE above (spec 09 B.1).
+    kept = [s for s in sents if PROTECTED_RE.search(s) or normalise(s) not in boilerplate]
     return " ".join(kept) if kept else None
 
 
@@ -459,7 +560,7 @@ def run(
     print(f"  === __GLOBAL__ flagged sentences ({len(flagged_global_audit)}) ===")
     for r in flagged_global_audit:
         print(f"    [{r['pct_of_bin']:>5.1f}% of {r['bin_size']:,} ads, "
-              f"{r['n_titles']} titles, {r['half_year']}]  {r['sentence_original']}")
+              f"{r['n_titles']} titles, {r['quarter']}]  {r['sentence_original']}")
     print()
 
     audit_rows = audit_rows + global_audit_rows
@@ -468,9 +569,15 @@ def run(
 
     print("Applying boilerplate filter (per-agency ∪ global)...")
 
+    # Header-path removals (op 2, _ABOUT_HEADER_RE whole-unit drop) leave no
+    # trace anywhere else in the record — this counter is what makes that
+    # removal path visible (09A diagnosis Step 3/B.3; per-row logging would be
+    # more complete but isn't cheap at this row count, so this is aggregate).
+    header_stats: dict[str, int] = {}
+
     def _clean(row) -> str | None:
         bp = agency_bp.get(row["agency_canonical"], frozenset()) | global_bp
-        return clean_description(row["description"], bp)
+        return clean_description(row["description"], bp, stats=header_stats)
 
     df["description_clean"] = df.apply(_clean, axis=1)
 
@@ -496,7 +603,9 @@ def run(
     print(f"  Fully stripped (all boilerplate): {n_fully_stripped}")
     print(f"  Characters retained:              {retained_pct:.1f}%")
     print(f"    ({clean_chars:,} / {orig_chars:,} chars)")
-    print(f"  Per-ad retention — median: {q[0.50]:.1%}  Q25: {q[0.25]:.1%}  Q75: {q[0.75]:.1%}\n")
+    print(f"  Per-ad retention — median: {q[0.50]:.1%}  Q25: {q[0.25]:.1%}  Q75: {q[0.75]:.1%}")
+    print(f"  Header-path removals (About-family whole-unit drops): {header_stats.get('about_header', 0):,} units")
+    print(f"  Label-only empty-after-strip removals:                {header_stats.get('label_empty', 0):,} units\n")
 
     # ── Audit CSV (always written: stable name + dated archive) ────────────────
     #
@@ -586,7 +695,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--global-threshold", type=float, default=DEFAULT_GLOBAL_THRESHOLD, metavar="FRAC",
-        help=f"Corpus-wide pass: fraction of ALL ads in a half-year bin that must "
+        help=f"Corpus-wide pass: fraction of ALL ads in a quarterly bin that must "
              f"contain a sentence to flag it as gazette-wide boilerplate "
              f"(default: {DEFAULT_GLOBAL_THRESHOLD})",
     )

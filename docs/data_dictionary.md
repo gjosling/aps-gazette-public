@@ -85,9 +85,7 @@ A machine-readable predecessor/successor event table is published alongside the 
 | `relation` | `rename` (1→1), `merge` (N→1 or absorbed-into), or `split` (1→N; one row per successor). |
 | `note` | Short description of the change. |
 
-**Why the table carries no split weights.** Gazette vacancy flows track *functions and stand-up timing*, not headcount shares. When DAWE split into DAFF and DCCEEW, the split of *advertised vacancies* depends on which functions were hiring in a given period and on the new department's stand-up recruitment surge — neither of which a static headcount share captures. Any single weight pair would be defensible for one analytical question and wrong for another, so no general-purpose weights exist to publish. Users bridging a series across a split boundary must make their own apportionment call — and the right call is often "don't bridge; annotate the break". The table tells you *where* the breaks are and *what* happened; it deliberately does not tell you how to allocate.
-
-**`effective_date` is statutory, not first-appearance.** The dates are Administrative Arrangements Order / commencement dates, not the first date the new name appears in this dataset. Gazette usage lags renames by weeks — e.g. IHPA-named rows keep appearing until 2022-08-25, after the 2022-08-12 IHACPA rename. So date heuristics derived from the row data run late (do not use them to "correct" a statutory date), and users joining `agency_lineage.csv` to the data should expect old names to persist briefly past each `effective_date`.
+**`effective_date` is statutory, not first appearance.** The dates are Administrative Arrangements Order / commencement dates, not the first date the new name appears in this dataset. Gazette usage lags renames by weeks — e.g. IHPA-named rows keep appearing until 2022-08-25, after the 2022-08-12 IHACPA rename. So date heuristics derived from the row data run late (do not use them to "correct" a statutory date), and users joining `agency_lineage.csv` to the data should expect old names to persist briefly past each `effective_date`.
 
 **Lineage events vs. how a chain is represented — two modes.** The lineage table records machinery-of-government *events*; how the dataset *represents* each chain in `agency_canonical` is a separate, per-chain choice. Two conventions are in use:
 
@@ -121,7 +119,8 @@ The convention is enforced at build time by the division-mismatch check (`pipeli
 |--------|------|-------------|
 | `job_title` | string | Job title as printed in the notice. |
 | `is_affirmative_measure` | bool (never null) | True where `job_title` matches `(?i)affirmative\s+measure` (nulls → False). Flags roles advertised under an Affirmative Measures variant. |
-| `posting_group_id` | string (nullable) | 12-hex-char key linking Affirmative Measures variants of one posting to each other and their base posting. Populated **only** for rows belonging to a group that contains ≥ 1 AM row (including a singleton AM row, which gets a group of size 1). Null everywhere else. See the "Affirmative-measures multi-posting" limitation below for counting guidance. |
+| `posting_group_id` | string (nullable) | 12-hex-char key linking Affirmative Measures variants of one posting to each other and their base posting. Populated **only** for rows belonging to a group that contains ≥ 1 AM row (including a singleton AM row, which gets a group of size 1). Null everywhere else. See the "Affirmative measures multi-posting" limitation below for counting guidance. |
+| `posting_kind` | string (nullable) | Posting-structure flag for ads that are not standard single-role postings. Values: `register` (standing pool: employment/talent/s26/transfer registers, talent pools/pipelines, EOI ads), `entry_program` (structured training intake: graduate, apprenticeship, cadetship, traineeship, internship, school-leaver and named diversity-intake programs, including single training positions), `bulk_round` (one ad advertising multiple positions: named bulk/recruitment rounds, "multiple/various/several positions", explicit xN multipliers, body-text assertions of multiple vacancies). Null otherwise. See the "Non-standard postings" limitation below. |
 | `job_type` | string | Employment type as printed. Two comma-separated dimensions (hours arrangement and tenure) each semicolon-separated where multiple values apply (e.g. `Full-Time;Part-Time, Ongoing;Non-Ongoing`). |
 | `location` | string | Work location as printed. May be multi-line or abbreviated. |
 | `location_normalised` | string | Same as `location` with comma-delimited parts sorted alphabetically. Use this column when grouping by location. The raw field preserves print order, which varies across notices for the same locations. Null where `location` is null. |
@@ -134,7 +133,11 @@ The convention is enforced at build time by the division-mismatch check (`pipeli
 | `closing_date_raw` | string | Closing date string as printed in the notice. |
 | `closing_date` | date | Closing date parsed from `closing_date_raw`. |
 
-**`posting_group_id` null semantics:** `posting_group_id = null` means "this row was not part of any affirmative-measures posting cluster" — it does **not** assert the row is unrelated to any other row. Non-AM multi-postings (bulk campaigns, re-advertisements) are deliberately not linked: the review found ~1,900 non-AM multi-row title groups that include genuinely distinct positions, and linking them would over-merge.
+**`posting_group_id` null semantics:** `posting_group_id = null` means "this row was not part of any affirmative measures posting cluster." It does **not** assert the row is unrelated to any other row. Non-AM multi-postings (bulk campaigns, re-advertisements) are deliberately not linked.
+
+**`posting_kind` null semantics:** `posting_kind = null` means **"standard single-role posting as far as the markers can tell — not a guarantee."** The flag is derived from title text (all categories), `classification_code` (entry_program) and raw description text (bulk_round only). Ads that assert plural positions in phrasings elsewhere remain null. The largest known unflagged class is plural role noun titles ("Media Officers", "Executive Assistants"), which often but not reliably advertise several positions while asserting nothing countable. See the "Non-standard postings" limitation below for the measured residual.
+
+**The flag is for segmentation, not count correction:** unlike `posting_group_id`, which links known duplicate rows so counts can be corrected, `posting_kind` marks rows whose position count is unknowable from the gazette. Do not "fix" counts with it; exclude or separately report flagged rows. A bulk ad still contributes exactly one `vacancy_no` to naive counts while concealing an unknown number of positions.
 
 ### Office arrangement
 
@@ -154,15 +157,16 @@ The convention is enforced at build time by the division-mismatch check (`pipeli
 | Column | Type | Description |
 |--------|------|-------------|
 | `description` | string | Full job description text as extracted from the PDF, with PII redacted. Email addresses are replaced with `[email redacted]`, Australian phone numbers with `[phone redacted]`, and contact officer names with `[name redacted]`. Name redaction applies to title-case names (2–4 words, each capitalised) appearing directly after "Please contact", "Contact Officer:", or "For Enquiries:"; names not in title case are not caught. Includes duties, selection criteria, and any additional notes. |
-| `description_clean` | string | Boilerplate-stripped and PII-redacted version of `description`. Agency-standard sentences (mission statements, RecruitAbility text, citizenship requirements, standard screening language) are removed; role-specific content is preserved. PII redaction follows the same rules as `description`. Null where `description` is null or where the entire description consisted of boilerplate. See Notes below. |
+| `description_clean` | string | Boilerplate-stripped and PII-redacted version of `description`. Agency-standard sentences (mission statements, RecruitAbility text, citizenship requirements, standard screening language) are removed; a fixed set of substantive markers (multi-position, pool/register, intake-structure and eligibility statements — see the method note's protected-phrase guard) are never stripped even when they are also frequency-flagged template text. Outside that guarded set, the stripping is still frequency-based and can remove substantive template sentences an agency standardises across its ads. A genuine standalone section header ("About the X Division", with no sentence fused to it) is always dropped. Analyses keying on standardised phrasing should use raw `description`. PII redaction follows the same rules as `description`. Null where `description` is null or where the entire description consisted of boilerplate. See Notes below. |
 | `duties_text` | string | Job responsibilities section extracted from `description`, bounded by the `Duties`/`The Role` section marker and the `Eligibility` marker. Section labels are stripped. Email addresses, phone numbers, and title-case contact officer names are redacted (see `description` for redaction caveats). Null where no duties-type marker is present. Where `Eligibility` is absent, text runs to the end of `description`. |
 
-**`description_clean` method:** Produced by `pipeline/07_clean_text.py` using a frequency-based method with two passes; a sentence removed by either pass is stripped.
+**`description_clean` method:** Produced by `pipeline/07_clean_text.py` using a frequency-based method with two passes; a sentence removed by either pass is stripped unless it matches the protected-phrase guard below.
 
-- **Per-agency pass:** sentences appearing in ≥30% of an agency's ads within any half-year bin of ≥10 ads, and across ≥3 distinct job titles, are flagged as boilerplate. The title-diversity guard prevents bulk recruitment campaigns (identical ads posted to multiple locations under the same title) from being misidentified as boilerplate.
-- **Global pass:** sentences appearing in ≥40% of *all* ads in any half-year bin, and across ≥30 distinct job titles, are flagged corpus-wide and removed from every agency. This catches gazette-wide template text — the RecruitAbility standard passage and the May-2025 eligibility passage — that small agencies' own bins can never learn (a small agency never reaches the 10-ad per-bin minimum, so the per-agency pass alone would leave that template in their ads).
+- **Per-agency pass:** sentences appearing in ≥30% of an agency's ads within any quarterly bin of ≥10 ads, and across ≥3 distinct job titles, are flagged as boilerplate. The title-diversity guard prevents bulk recruitment campaigns (identical ads posted to multiple locations under the same title) from being misidentified as boilerplate.
+- **Global pass:** sentences appearing in ≥40% of *all* ads in any quarterly bin, and across ≥30 distinct job titles, are flagged corpus-wide and removed from every agency. This catches gazette-wide template text — the RecruitAbility standard passage and the May-2025 eligibility passage — that small agencies' own bins can never learn (a small agency never reaches the 10-ad per-bin minimum, so the per-agency pass alone would leave that template in their ads).
+- **Protected-phrase guard:** a sentence matching a fixed set of substantive markers (multi-position/vacancy assertions, pool or register statements, expressions of interest, graduate/apprenticeship/cadetship intake structure, identified-position eligibility statements) is never stripped, even if it is also flagged by either frequency pass — the sentence is template *and* substantive, and substantive wins. The boilerplate audit CSV (`data/diagnostics/boilerplate_sentences.csv`) still lists these entries, with `protected=True`, so template frequency stays visible even though the text isn't removed.
 
-The method is **versioned**; the current version is `2026-07-v2` and is recorded in the parquet key-value metadata (`aps_gazette:boilerplate_method_version`) and the `.meta.json` sidecar. `description_clean` may change retroactively between method versions — the raw `description` column never does. The canonical example is the May-2025 gazette template change: from 2025Q3 the raw descriptions gained a standard eligibility passage ("… employed under the Public Service Act 1999. Similar conditions may apply when employed under other Acts. For clarification please contact the agency.") present in ~77% of notices; the `2026-07-v2` global pass removes it from `description_clean`, including for the small agencies the earlier per-agency-only method could not clean.
+The method is **versioned**; the current version is `2026-07-v3` and is recorded in the parquet key-value metadata (`aps_gazette:boilerplate_method_version`) and the `.meta.json` sidecar. `description_clean` may change retroactively between method versions — the raw `description` column never does. The canonical example is the May-2025 gazette template change: from 2025Q3 the raw descriptions gained a standard eligibility passage ("… employed under the Public Service Act 1999. Similar conditions may apply when employed under other Acts. For clarification please contact the agency.") present in ~77% of notices; the global pass removes it from `description_clean`, including for the small agencies the earlier per-agency-only method could not clean. `2026-07-v3` additionally fixed a segmenter bug where an inline "About the/our/us <section>" header fused to the following sentence (no punctuation between them, e.g. "About the Role We have a number of roles available…") caused the *entire fused unit* — header and substantive sentence alike — to be dropped; the header and body are now split apart, so only the header is dropped and the body sentence is evaluated normally.
 
 ### Job family classification
 
@@ -178,15 +182,15 @@ Classified using `claude-sonnet-4-6` against the [APSC 2025 Job Family Framework
 
 ## Known limitations
 
-### Affirmative-measures multi-posting
+### Affirmative measures multi-posting
 
 APS agencies frequently gazette the same role two or three times: a base
 advertisement plus one or more **Affirmative Measures** variants (Disability;
 Aboriginal and Torres Strait Islander / First Nations), each with its own
 `vacancy_no`. A naive `count(*)` therefore overstates the number of distinct
-roles advertised. In the current release there are **3,452 AM-titled rows**; the
-AM-duplicate excess is roughly **2.6% of the dataset** and has grown over time
-(228 AM rows in 2020 → 721 in 2024).
+roles advertised. AM-titled rows are roughly 4% of the dataset and the
+AM-duplicate excess is roughly 2.6%, and has grown over time (roughly tripling
+between 2020 and 2024).
 
 `posting_group_id` links these variants. Rows sharing an agency, base title (with
 the AM phrasing stripped), classification, and closing date receive a common
@@ -199,8 +203,13 @@ df["role_key"] = df["posting_group_id"].fillna(df["vacancy_no"])
 n_roles = df["role_key"].nunique()
 ```
 
-On the current release this collapses 87,340 rows to **85,460 role keys** (1,880
-excess rows, 2.2%).
+Note that `posting_kind` non-null rows still contribute one role key each while
+representing zero-to-many actual positions (a register) or several (a bulk
+round). For position-level analyses, exclude or separately report
+`posting_kind` non-null rows — see the Non-standard postings limitation.
+
+On the current release this removes roughly 2.2% of rows as AM-duplicate
+excess.
 
 **Residual risks:**
 
@@ -212,12 +221,11 @@ excess rows, 2.2%).
 - **Re-advertisements not linked:** `posting_group_id` links within **one closing
   cycle only**. The same role re-advertised with a later closing date forms a
   separate group by design.
-- **Classification-split under-merge (~1% of groups):** because
+- **Classification split under-merge (~1% of groups):** because
   `classification_code` is part of the key, groups where the base row advertises
   a multi-level band (e.g. `APS5;APS6`) and the AM row a single level (`APS6`) can
-  fail to link the AM row to its base. This is deliberate: **under-merging is
-  preferred to over-merging** — an unlinked duplicate is at worst the status quo,
-  whereas silently collapsing distinct roles understates hiring.
+  fail to link the AM row to its base. This is deliberate, s under-merging is
+  preferred to over-merging.
 
 **`position_number` is *not* used for linkage.** It was measured and rejected:
 ~85% of true AM groups mint a *separate per-variant requisition number* (so a
@@ -225,11 +233,67 @@ position-number key would fail to link them), and 58% of reused position numbers
 span genuinely distinct roles (so it would also over-merge). Linkage is computed
 purely from the (agency, AM-stripped title, classification, closing date) hash.
 
+### Non-standard postings (`posting_kind`)
+
+The dataset contains ads that are not standard single-role postings: standing
+**registers** (temporary employment registers, s26 transfer registers, talent
+registers/pipelines, EOI pools), **entry programs** (graduate, apprenticeship,
+cadetship, traineeship, internship and school-leaver intakes), and **bulk
+rounds** ("multiple positions", "various opportunities", named bulk
+recruitment rounds). `posting_kind` flags these rows; at release time roughly
+7% of the dataset is flagged, with bulk_round the largest category, followed
+by register and entry_program. It composes with
+`is_affirmative_measure`/`posting_group_id` without altering either — some
+flagged rows also carry a `posting_group_id` and keep both markings (e.g. an
+AM bulk-round variant is `bulk_round`, `is_affirmative_measure=True`, and
+grouped with its base ad).
+
+**Not a count correction.** Unlike `posting_group_id`, which links known
+duplicate rows so counts can be corrected, `posting_kind` marks rows whose
+relationship to a headcount is unknowable from the gazette. A bulk ad may
+conceal two positions or forty; a register may lead to zero hires or dozens.
+Exclude or separately report flagged rows — do not use the flag to "fix"
+counts.
+
+**Category derivation, at a glance:**
+
+- **register** is derived from title text only. Body matching (e.g.
+  `employment register|talent register`) was tested and rejected — it adds
+  few candidate rows at low precision (agency boilerplate, duty statements
+  of roles that administer a register). EOI (`EOI`,
+  `expression(s) of interest`) titles are classed `register`; roughly half
+  solicit interest in a single named role rather than a standing pool, but
+  are still not standard vacancy notices.
+- **entry_program** is derived from title text and `classification_code`
+  only, no body text. Body `graduate program` was tested and rejected —
+  the candidates were overwhelmingly false positives from the gazette's
+  standard "*this vacancy has been nominated for filling within the
+  agency's graduate program*" boilerplate, which marks a fill mechanism on
+  otherwise standard postings, not posting structure. `entry_program`
+  includes some single-position training roles (e.g. "Trainee Document
+  Examiner", "Apprentice Chef") — the category flags training-intake
+  structure, not bulk hiring.
+- **bulk_round** is derived from title and body text. Anchored body phrases
+  (e.g. "seeking to fill multiple positions") add a meaningful share of the
+  category at high precision; unanchored `bulk recruitment` was tested and
+  rejected — it also matches past-reference boilerplate and duty statements
+  of roles that administer bulk rounds.
+- **"Multiple/Various Locations" titles are deliberately null** — location
+  plurality does not assert position plurality. Some are in fact
+  multi-position ads; this is an accepted residual, not a bug.
+
+**AGGP caveat (documented, not fixable):** Australian Government Graduate
+Program stream ads are gazetted by a coordinating agency while hires land
+across many agencies — in a sample of AGGP/stream-shaped ads, Finance
+gazetted the largest share, with AGD, APSC, Treasury, ABS and ONI hosting
+most of the rest. Agency-level `entry_program` counts therefore attribute
+whole-of-APS intakes to the coordinating agency.
+
 ### Job family classification accuracy
 
 `job_family` is assigned by `claude-sonnet-4-6` (prompt version `2025-v2`) and is not guaranteed correct. Overall accuracy on a 200-ad hand-labelled validation sample: 88%. Accuracy is highest for roles with distinctive titles or detailed descriptions and lowest for generic or pooled advertisements.
 
-A substantial minority of classifications carry `medium` or `low` confidence. These are most common for generic job titles (e.g. "Assistant Director", "Policy Officer") and pooled recruitment ads spanning multiple role types. For precision-sensitive analysis, filter to `job_family_confidence = 'high'` (~98% accuracy on the validation sample). Do not use `job_family` as ground truth; treat it as a best-effort signal and validate a sample for your use case.
+A substantial minority of classifications carry `medium` or `low` confidence. These are most common for generic job titles (e.g. "Assistant Director", "Policy Officer") and pooled recruitment ads spanning multiple role types. For precision-sensitive analysis, filter to `job_family_confidence = 'high'` (~98% accuracy on the validation sample). Pooled advertisements can also be identified and filtered via `posting_kind` (see Non-standard postings). Do not use `job_family` as ground truth; treat it as a best-effort signal and validate a sample for your use case.
 
 ### Manual classification overrides
 
