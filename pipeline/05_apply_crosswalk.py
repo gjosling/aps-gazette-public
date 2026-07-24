@@ -317,13 +317,19 @@ def run():
     #   VN-0700097 — raw agency printed as TGA in the source PDF, division
     #     "Independent Hospital Pricing Authority"; a gazette-source error (fields
     #     parse cleanly). The role is IHPA's.
-    # Correcting these removes the two mismatched pairs from the division-mismatch
+    #   VN-0771081 — raw agency "Australian Submarine Agency", division/branch
+    #     "Australian Naval Nuclear Power Safety Regulator" / "Director General",
+    #     job "ANNPSR Graduate Program" (2 rows). An ANNPSR posting advertised via
+    #     ASA while ANNPSR stands up. ANNPSR is a first-class canonical agency
+    #     here, so the role is attributed to it rather than left under ASA.
+    # Correcting these removes the mismatched pairs from the division-mismatch
     # scan, which is why the corresponding ALLOWED_DIVISION_MISMATCH entries were
-    # deleted. These change agency_canonical/agency_group only, not vacancy
-    # identity.
+    # deleted (never added, for VN-0771081). These change agency_canonical/
+    # agency_group only, not vacancy identity.
     VACANCY_NO_OVERRIDES = {
         "VN-0704814": "Parliamentary Workplace Support Service",
         "VN-0700097": "Independent Hospital Pricing Authority",
+        "VN-0771081": "Australian Naval Nuclear Power Safety Regulator",
     }
     for vn, canon in VACANCY_NO_OVERRIDES.items():
         mask = df['vacancy_no'] == vn
